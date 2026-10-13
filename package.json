@@ -1,6 +1,6 @@
 {
   "name": "decky-whatsapp-bridge",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "PC-side WhatsApp Web bridge for a Steam Deck Decky plugin.",
   "type": "module",
@@ -27,5 +27,8 @@
     "patch-package": "^8.0.1",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "basic-ftp": "6.2.1"
   }
 }

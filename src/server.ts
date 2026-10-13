@@ -165,6 +165,22 @@ app.post("/messages", async (request, response) => {
   }
 });
 
+app.post("/messages/delete", async (request, response) => {
+  const { chatId, messageId } = request.body as { chatId?: unknown; messageId?: unknown };
+  if (typeof chatId !== "string" || !chatId || typeof messageId !== "string" || !messageId) {
+    response.status(400).json({ error: "chatId and messageId are required" });
+    return;
+  }
+  try {
+    console.log("[bridge] deleting message", { chatId, messageId });
+    await whatsapp.deleteMessage(chatId, messageId);
+    response.json({ deleted: true });
+  } catch (error) {
+    console.error("[bridge] message deletion failed", error);
+    response.status(409).json({ error: error instanceof Error ? error.message : "Unable to delete message" });
+  }
+});
+
 app.post("/reactions", async (request, response) => {
   const { chatId, messageId, emoji } = request.body as { chatId?: unknown; messageId?: unknown; emoji?: unknown };
   if (typeof chatId !== "string" || !chatId || typeof messageId !== "string" || !messageId) {

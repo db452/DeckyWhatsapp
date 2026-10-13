@@ -23,6 +23,8 @@ type RuntimeMessage = {
   from: string;
   author?: string;
   fromMe: boolean;
+  ack?: unknown;
+  delete: (deleteForEveryone?: boolean) => Promise<void>;
   timestamp: number;
   body?: string;
   type?: string;
@@ -33,6 +35,13 @@ type RuntimeMessage = {
   getContact: () => Promise<{ name?: string; pushname?: string; shortName?: string; verifiedName?: string }>;
   downloadMedia: () => Promise<{ mimetype: string; data: string; filename?: string | null } | null | undefined>;
 };
+
+function getMessageAck(message: { ack?: unknown; _data?: Record<string, unknown> & { ack?: unknown } }): number | undefined {
+  const value = message.ack ?? message._data?.ack;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  return undefined;
+}
 
 type RuntimeReactionEvent = {
   msgId?: RuntimeMessageId | string;
@@ -233,6 +242,7 @@ export class WhatsAppService {
         body: formatMessageBody(message, media),
         timestamp: message.timestamp,
         fromMe: message.fromMe,
+        ack: getMessageAck(message),
         mediaKind: getMediaKind(message),
         image: undefined,
         media: undefined
@@ -435,6 +445,7 @@ export class WhatsAppService {
         body: formatMessageBody(message, media),
         timestamp: message.timestamp,
         fromMe: message.fromMe,
+        ack: getMessageAck(message),
         mediaKind: media?.kind,
         reaction,
         reactions: reactionsList.length > 0 ? reactionsList : undefined,
@@ -461,6 +472,18 @@ export class WhatsAppService {
     });
     await this.client.sendMessage(chatId, body, quotedMessageId ? { quotedMessageId } : undefined);
     console.log("[whatsapp] sendMessage completed", { chatId, quotedMessageId: quotedMessageId || null });
+  }
+
+  async deleteMessage(chatId: string, messageId: string): Promise<void> {
+    if (this.status !== "ready") throw new Error("WhatsApp is not ready");
+    const chat = await this.client.getChatById(chatId);
+    const messages = await chat.fetchMessages({ limit: 100 });
+    let message = messages.find((candidate) => getMessageId(candidate, "") === messageId) as unknown as RuntimeMessage | undefined;
+    if (!message) message = await this.client.getMessageById(messageId) as unknown as RuntimeMessage | undefined;
+    if (!message) throw new Error("WhatsApp message could not be found");
+    if (!message.fromMe) throw new Error("Only your own messages can be deleted");
+    await message.delete(true);
+    console.log("[whatsapp] message deleted", { chatId, messageId });
   }
 
   async reactToMessage(chatId: string, messageId: string, emoji: string): Promise<void> {

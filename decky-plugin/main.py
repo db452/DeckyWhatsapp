@@ -113,6 +113,15 @@ class Plugin:
     async def _unload(self):
         pass
 
+    async def voice_typing_status(self):
+        """Report whether the optional local Whisper installation is usable."""
+        try:
+            whisper = _read_executable(WHISPER_PATH_FILE)
+            model = _read_data_file(MODEL_PATH_FILE)
+            return {"available": True, "executable": str(whisper), "model": str(model)}
+        except Exception as error:
+            return {"available": False, "reason": str(error).strip() or error.__class__.__name__}
+
     async def transcribe_audio(self, audio_base64: str) -> str:
         try:
             try:

@@ -1,7 +1,7 @@
 import { call, definePlugin, toaster } from "@decky/api";
 import { ButtonItem, PanelSection, PanelSectionRow, TextField } from "@decky/ui";
 import { FaArrowLeft, FaClock, FaCog, FaFilter, FaMicrophone, FaPaperPlane, FaReply, FaSortAlphaDown, FaStop, FaUsers, FaWhatsapp } from "react-icons/fa";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
 type BridgeStatus = "starting" | "qr_required" | "authenticated" | "ready" | "disconnected" | "auth_failure" | "disabled" | "unknown";
@@ -52,6 +52,11 @@ type ReplyTarget = {
   id: string;
   sender: string;
   body: string;
+};
+
+type VoiceTypingStatus = {
+  available: boolean;
+  reason?: string;
 };
 
 const defaultBridgeUrl = "http://127.0.0.1:8787";
@@ -125,8 +130,36 @@ function errorMessage(value: unknown): string {
   return String(value);
 }
 
+function uniqueReactions(reactions: string[] | undefined): string[] | undefined {
+  const seen = new Set<string>();
+  const unique = (reactions || []).filter((reaction) => {
+    if (!reaction) return false;
+    const key = reaction.normalize("NFC").replace(/\uFE0F/g, "");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return unique.length > 0 ? unique : undefined;
+}
+
 function formatDiagnosticTime(value?: number): string {
   return value ? new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "Never";
+}
+
+function messageStatus(ack?: number): { symbol: string; color: string; label: string } {
+  if (ack === -1) return { symbol: "!", color: "#ff8d8d", label: "Failed" };
+  if (ack === 0) return { symbol: "…", color: "rgba(255,255,255,0.55)", label: "Sending" };
+  if (ack !== undefined && ack >= 3) return { symbol: "✓✓", color: "#63b9ff", label: "Read" };
+  if (ack !== undefined && ack >= 2) return { symbol: "✓✓", color: "rgba(255,255,255,0.65)", label: "Delivered" };
+  return { symbol: "✓", color: "rgba(255,255,255,0.65)", label: "Sent" };
+}
+
+function isTextEntryFocused(): boolean {
+  const activeElement = document.activeElement;
+  if (!activeElement) return false;
+  if (activeElement instanceof HTMLInputElement || activeElement instanceof HTMLTextAreaElement || activeElement instanceof HTMLSelectElement) return true;
+  if (activeElement instanceof HTMLElement && activeElement.isContentEditable) return true;
+  return Boolean(activeElement.closest("input, textarea, select, [contenteditable=\"true\"]"));
 }
 
 async function getBridgeToken(httpUrl: string): Promise<string> {
@@ -188,24 +221,33 @@ function stopBackgroundNotifications(): void {
 }
 
 function startBackgroundNotifications(): void {
-  if (window.localStorage.getItem("decky-whatsapp-enabled") !== "true") return;
+  if (
+    window.localStorage.getItem("decky-whatsapp-enabled") !== "true" ||
+    window.localStorage.getItem("decky-whatsapp-notifications-enabled") === "false"
+  ) return;
 
   stopBackgroundNotifications();
   const run = backgroundNotificationRun;
 
   const connect = async () => {
-    if (run !== backgroundNotificationRun || window.localStorage.getItem("decky-whatsapp-enabled") !== "true") return;
+    if (
+      run !== backgroundNotificationRun ||
+      window.localStorage.getItem("decky-whatsapp-enabled") !== "true" ||
+      window.localStorage.getItem("decky-whatsapp-notifications-enabled") === "false"
+    ) return;
     const socket = new WebSocket(await bridgeWebSocketUrl(defaultBridgeUrl));
     backgroundNotificationSocket = socket;
     socket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data) as BridgeEvent;
         if (message.type !== "message" || message.message.fromMe) return;
+        const showPreview = window.localStorage.getItem("decky-whatsapp-notification-previews") !== "false";
+        const soundEnabled = window.localStorage.getItem("decky-whatsapp-notification-sound") !== "false";
         toaster.toast({
-          title: `WhatsApp: ${message.message.chatName}`,
-          body: message.message.body || "New message",
+          title: showPreview ? `WhatsApp: ${message.message.chatName}` : "WhatsApp message",
+          body: showPreview ? (message.message.body || "New message") : "New message",
           duration: 5000,
-          playSound: true,
+          playSound: soundEnabled,
           showNewIndicator: true
         });
       } catch (error) {
@@ -288,6 +330,7 @@ function WhatsAppPanel() {
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [selectedChat, setSelectedChat] = useState<ChatSummary | undefined>();
   const [selectedChatId, setSelectedChatId] = useState("");
+  const selectedChatIdRef = useRef("");
   const [history, setHistory] = useState<IncomingMessage[]>([]);
   const [historyRefresh, setHistoryRefresh] = useState(0);
   const [ownReactions, setOwnReactions] = useState<Record<string, string | null>>({});
@@ -296,11 +339,19 @@ function WhatsAppPanel() {
   const [replyTarget, setReplyTarget] = useState<ReplyTarget | undefined>();
   const [historyLoading, setHistoryLoading] = useState(false);
   const [reply, setReply] = useState("");
+  const replyInputActive = useRef(false);
   const [error, setError] = useState("");
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "transcribing">("idle");
+  const [voiceTypingAvailable, setVoiceTypingAvailable] = useState<boolean | undefined>(undefined);
+  const [voiceTypingReason, setVoiceTypingReason] = useState("");
+  const [messageActionId, setMessageActionId] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [shuttingDown, setShuttingDown] = useState(false);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(() => window.localStorage.getItem("decky-whatsapp-notifications-enabled") !== "false");
+  const [notificationSoundEnabled, setNotificationSoundEnabled] = useState(() => window.localStorage.getItem("decky-whatsapp-notification-sound") !== "false");
+  const [notificationPreviewsEnabled, setNotificationPreviewsEnabled] = useState(() => window.localStorage.getItem("decky-whatsapp-notification-previews") !== "false");
+  const [notificationsWhileGaming, setNotificationsWhileGaming] = useState(() => window.localStorage.getItem("decky-whatsapp-notifications-while-gaming") !== "false");
   const [compactHistory, setCompactHistory] = useState(() => window.localStorage.getItem("decky-whatsapp-compact-history") !== "false");
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [historyHasMore, setHistoryHasMore] = useState(false);
@@ -319,6 +370,8 @@ function WhatsAppPanel() {
   const profilePicRequests = useRef(new Set<string>());
   const bridgeHealthFailures = useRef(0);
 
+  selectedChatIdRef.current = selectedChatId;
+
   const normalizedBridgeUrl = useMemo(() => bridgeUrl.replace(/\/$/, ""), [bridgeUrl]);
 
   const updateStatus = (nextStatus: BridgeStatus) => {
@@ -335,8 +388,8 @@ function WhatsAppPanel() {
     if (!Object.prototype.hasOwnProperty.call(ownReactions, message.id)) return message;
     const ownReaction = ownReactions[message.id];
     const otherReactions = (message.reactions || []).filter((reaction) => reaction !== reactionEmoji && reaction !== ownReaction);
-    const reactions = ownReaction ? [...new Set([...otherReactions, ownReaction])] : otherReactions;
-    return { ...message, reaction: ownReaction || undefined, reactions: reactions.length > 0 ? reactions : undefined };
+    const reactions = ownReaction ? [...otherReactions, ownReaction] : otherReactions;
+    return { ...message, reaction: ownReaction || undefined, reactions: uniqueReactions(reactions) };
   });
 
   useEffect(() => {
@@ -350,6 +403,42 @@ function WhatsAppPanel() {
   useEffect(() => {
     window.localStorage.setItem("decky-whatsapp-reaction-emoji", reactionEmoji);
   }, [reactionEmoji]);
+
+  useEffect(() => {
+    window.localStorage.setItem("decky-whatsapp-notifications-enabled", String(notificationsEnabled));
+    if (notificationsEnabled && enabled) startBackgroundNotifications();
+    else if (!notificationsEnabled) stopBackgroundNotifications();
+  }, [notificationsEnabled, enabled]);
+
+  useEffect(() => {
+    window.localStorage.setItem("decky-whatsapp-notification-sound", String(notificationSoundEnabled));
+  }, [notificationSoundEnabled]);
+
+  useEffect(() => {
+    window.localStorage.setItem("decky-whatsapp-notification-previews", String(notificationPreviewsEnabled));
+  }, [notificationPreviewsEnabled]);
+
+  useEffect(() => {
+    window.localStorage.setItem("decky-whatsapp-notifications-while-gaming", String(notificationsWhileGaming));
+  }, [notificationsWhileGaming]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void call<[], VoiceTypingStatus>("voice_typing_status")
+      .then((result) => {
+        if (cancelled) return;
+        setVoiceTypingAvailable(result.available);
+        setVoiceTypingReason(result.reason || "");
+      })
+      .catch(() => {
+        // Older installations may not have the optional status method yet.
+        // Keep the control usable and let transcription report its result.
+        if (!cancelled) setVoiceTypingAvailable(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const visibleChats = useMemo(() => {
     const ordered = [...chats].sort((left, right) => {
@@ -459,11 +548,11 @@ function WhatsAppPanel() {
           receivedSinceSession: existing?.receivedSinceSession || !incoming.fromMe,
           lastMessage: incoming.body,
           timestamp: incoming.timestamp,
-          unreadCount: existing ? existing.unreadCount + (incoming.fromMe || incoming.chatId === selectedChatId ? 0 : 1) : (incoming.fromMe ? 0 : 1)
+          unreadCount: existing ? existing.unreadCount + (incoming.fromMe || incoming.chatId === selectedChatIdRef.current ? 0 : 1) : (incoming.fromMe ? 0 : 1)
         };
         return [updated, ...current.filter((chat) => chat.chatId !== incoming.chatId)];
       });
-      if (incoming.chatId === selectedChatId) {
+      if (incoming.chatId === selectedChatIdRef.current) {
         setHistory((current) => current.some((message) => message.id === incoming.id) ? current : [...current, incoming]);
       }
     };
@@ -501,7 +590,7 @@ function WhatsAppPanel() {
           if (message.type === "status") updateStatus(message.status);
           if (message.type === "message") {
             addMessage(message.message);
-            if (message.message.chatId === selectedChatId && message.message.mediaKind) setHistoryRefresh((current) => current + 1);
+            if (message.message.chatId === selectedChatIdRef.current && message.message.mediaKind) setHistoryRefresh((current) => current + 1);
           }
           if (message.type === "message_update") {
             updateChatPreview(message.message);
@@ -513,14 +602,10 @@ function WhatsAppPanel() {
           if (message.type === "reaction") {
             setHistory((current) => current.map((existing) => {
               if (existing.id !== message.messageId) return existing;
-              const ownReaction = message.fromMe ? (message.emoji || existing.reaction) : existing.reaction;
-              const reactions = [...(existing.reactions || [])];
-              if (message.emoji && !reactions.includes(message.emoji)) reactions.push(message.emoji);
-              if (message.fromMe && !message.emoji && ownReaction) {
-                const index = reactions.indexOf(ownReaction);
-                if (index >= 0) reactions.splice(index, 1);
-              }
-              return { ...existing, reaction: message.fromMe ? (message.emoji || undefined) : existing.reaction, reactions: reactions.length ? reactions : undefined };
+              const ownReaction = message.fromMe ? (message.emoji || undefined) : existing.reaction;
+              const reactions = (existing.reactions || []).filter((reaction) => !message.fromMe || reaction !== existing.reaction);
+              if (message.emoji) reactions.push(message.emoji);
+              return { ...existing, reaction: ownReaction, reactions: uniqueReactions(reactions) };
             }));
             if (message.fromMe) setOwnReactions((current) => ({ ...current, [message.messageId]: message.emoji || null }));
           }
@@ -624,6 +709,7 @@ function WhatsAppPanel() {
     // Decky's controller button values: A=0, B=1, X=2, Y=3, D-pad left=7.
     const registration = input.RegisterForControllerInputMessages((_controllerIndex, gamepadButton, isButtonPressed) => {
       if (isButtonPressed && gamepadButton === 2) {
+        if (isTextEntryFocused() || replyInputActive.current) return;
         const focusedMessage = history.find((message) => message.id === focusedMessageId) || history.find((message) => message.id === selectedMessageId);
         if (focusedMessage) {
           const trackedReaction = Object.prototype.hasOwnProperty.call(ownReactions, focusedMessage.id)
@@ -660,7 +746,6 @@ function WhatsAppPanel() {
     }
     window.localStorage.setItem("decky-whatsapp-enabled", "true");
     setEnabled(true);
-    startBackgroundNotifications();
     setError("");
   };
 
@@ -740,13 +825,15 @@ function WhatsAppPanel() {
 
   const sendReply = async () => {
     if (!selectedChatId || !reply.trim()) return;
+    const body = reply.trim();
+    const chatName = selectedChat?.chatName || "Conversation";
     setError("");
-    console.log("[decky-whatsapp] sending reply", { chatId: selectedChatId, quotedMessageId: replyTarget?.id, bodyLength: reply.trim().length });
+    console.log("[decky-whatsapp] sending reply", { chatId: selectedChatId, quotedMessageId: replyTarget?.id, bodyLength: body.length });
     try {
       const response = await bridgeFetch(`${normalizedBridgeUrl}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId: selectedChatId, body: reply, quotedMessageId: replyTarget?.id })
+        body: JSON.stringify({ chatId: selectedChatId, body, quotedMessageId: replyTarget?.id })
       });
       if (!response.ok) {
         const details = await response.json().catch(() => undefined) as { error?: string } | undefined;
@@ -756,6 +843,16 @@ function WhatsAppPanel() {
       const message = sendError instanceof Error ? sendError.message : "Message could not be sent";
       console.error("[decky-whatsapp] send failed", sendError);
       reportError(message);
+      setHistory((current) => [...current, {
+        id: `local-failed-${Date.now()}`,
+        chatId: selectedChatId,
+        chatName,
+        sender: "You",
+        body,
+        timestamp: Math.floor(Date.now() / 1000),
+        fromMe: true,
+        ack: -1
+      }]);
       return;
     }
 
@@ -768,6 +865,54 @@ function WhatsAppPanel() {
       reportError("Message was sent, but the conversation could not be refreshed");
     } finally {
       setHistoryLoading(false);
+    }
+  };
+
+  const retryMessage = async (message: IncomingMessage) => {
+    if (!selectedChatId || !message.fromMe || message.ack !== -1 || messageActionId) return;
+    setMessageActionId(message.id);
+    setError("");
+    try {
+      const response = await bridgeFetch(`${normalizedBridgeUrl}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chatId: message.chatId, body: message.body })
+      });
+      if (!response.ok) {
+        const details = await response.json().catch(() => undefined) as { error?: string } | undefined;
+        throw new Error(details?.error || `retry failed (${response.status})`);
+      }
+      setHistory((current) => current.filter((currentMessage) => currentMessage.id !== message.id));
+      await loadHistory(selectedChatId, compactHistory && !historyExpanded ? 5 : 50);
+    } catch (retryError) {
+      reportError(retryError instanceof Error ? retryError.message : "Message could not be retried");
+    } finally {
+      setMessageActionId("");
+    }
+  };
+
+  const deleteMessage = async (message: IncomingMessage) => {
+    if (!selectedChatId || !message.fromMe || messageActionId) return;
+    setMessageActionId(message.id);
+    setError("");
+    try {
+      const response = await bridgeFetch(`${normalizedBridgeUrl}/messages/delete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chatId: message.chatId, messageId: message.id })
+      });
+      if (!response.ok) {
+        const details = await response.json().catch(() => undefined) as { error?: string } | undefined;
+        throw new Error(details?.error || `delete failed (${response.status})`);
+      }
+      setHistory((current) => current.map((currentMessage) => currentMessage.id === message.id
+        ? { ...currentMessage, body: "[Message deleted]", mediaKind: undefined, image: undefined, media: undefined, reaction: undefined, reactions: undefined }
+        : currentMessage));
+      toaster.toast({ title: "WhatsApp", body: "Message deleted", duration: 2500 });
+    } catch (deleteError) {
+      reportError(deleteError instanceof Error ? deleteError.message : "Message could not be deleted");
+    } finally {
+      setMessageActionId("");
     }
   };
 
@@ -787,8 +932,8 @@ function WhatsAppPanel() {
       setHistory((current) => current.map((message) => {
         if (message.id !== messageId) return message;
         const otherReactions = (message.reactions || []).filter((reaction) => reaction !== reactionEmoji && reaction !== emoji);
-        const reactions = emoji ? [...new Set([...otherReactions, emoji])] : otherReactions;
-        return { ...message, reaction: emoji || undefined, reactions: reactions.length > 0 ? reactions : undefined };
+        const reactions = emoji ? [...otherReactions, emoji] : otherReactions;
+        return { ...message, reaction: emoji || undefined, reactions: uniqueReactions(reactions) };
       }));
     } catch (reactionError) {
       const message = reactionError instanceof Error ? reactionError.message : "Reaction could not be sent";
@@ -812,6 +957,10 @@ function WhatsAppPanel() {
 
   const startVoiceTyping = async () => {
     if (voiceState === "transcribing") return;
+    if (voiceTypingAvailable === false) {
+      toaster.toast({ title: "Voice typing unavailable", body: voiceTypingReason || "Install the optional Deck-local Whisper engine first", duration: 6000 });
+      return;
+    }
     if (voiceState === "recording") {
       const session = voiceSession.current;
       if (!session) return;
@@ -827,7 +976,12 @@ function WhatsAppPanel() {
         if (session.chunks.length === 0) throw new Error("No audio was captured from the microphone");
         const transcript = await call<[string], string>("transcribe_audio", arrayBufferToBase64(wav));
         if (transcript.startsWith("__VOICE_ERROR__")) {
-          throw new Error(transcript.slice("__VOICE_ERROR__".length));
+          const details = transcript.slice("__VOICE_ERROR__".length);
+          if (/marker|not installed|executable|model is missing|path is empty/i.test(details)) {
+            setVoiceTypingAvailable(false);
+            setVoiceTypingReason(details);
+          }
+          throw new Error(details);
         }
         if (!transcript?.trim()) throw new Error("Whisper returned no text");
         setReply((current) => current ? `${current} ${transcript.trim()}` : transcript.trim());
@@ -925,6 +1079,11 @@ function WhatsAppPanel() {
       {!selectedChatId && showSettings && !showDiagnostics && (
         <PanelSection title="Settings">
           <PanelSectionRow><div style={{ opacity: 0.7, fontSize: "13px", padding: "4px 0 8px" }}>Choose how your WhatsApp contacts are arranged.</div></PanelSectionRow>
+          <PanelSectionRow><div style={{ opacity: 0.7, fontSize: "13px", padding: "8px 0 2px" }}>Notifications</div></PanelSectionRow>
+          <PanelSectionRow><ButtonItem layout="below" onClick={() => setNotificationsEnabled((current) => !current)}><div style={{ textAlign: "left" }}><strong>{notificationsEnabled ? "✓ " : ""}Show notifications</strong><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Show a Decky notification when a new WhatsApp message arrives.</div></div></ButtonItem></PanelSectionRow>
+          <PanelSectionRow><ButtonItem layout="below" onClick={() => setNotificationSoundEnabled((current) => !current)}><div style={{ textAlign: "left" }}><strong>{notificationSoundEnabled ? "✓ " : ""}Play notification sounds</strong><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Play a sound with new message notifications.</div></div></ButtonItem></PanelSectionRow>
+          <PanelSectionRow><ButtonItem layout="below" onClick={() => setNotificationPreviewsEnabled((current) => !current)}><div style={{ textAlign: "left" }}><strong>{notificationPreviewsEnabled ? "✓ " : ""}Show message previews</strong><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Include the contact name and message text in notifications.</div></div></ButtonItem></PanelSectionRow>
+          <PanelSectionRow><ButtonItem layout="below" onClick={() => setNotificationsWhileGaming((current) => !current)}><div style={{ textAlign: "left" }}><strong>{notificationsWhileGaming ? "✓ " : ""}Notify while gaming</strong><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Keep message notifications active after leaving this plugin.</div></div></ButtonItem></PanelSectionRow>
           <PanelSectionRow><div style={{ opacity: 0.7, fontSize: "13px", padding: "8px 0 2px" }}>Select default reaction (press x)</div></PanelSectionRow>
           {reactionChoices.map((emoji) => <PanelSectionRow key={emoji}><ButtonItem layout="below" onClick={() => setReactionEmoji(emoji)}><span style={{ fontSize: "22px" }}>{reactionEmoji === emoji ? "✓ " : "  "}{emoji}</span></ButtonItem></PanelSectionRow>)}
           {(Object.keys(contactModeLabels) as ContactMode[]).map((mode) => (
@@ -965,28 +1124,40 @@ function WhatsAppPanel() {
           {!historyLoading && history.length === 0 && <PanelSectionRow><div style={{ opacity: 0.7 }}>No message history</div></PanelSectionRow>}
           {!historyLoading && compactHistory && !historyExpanded && historyHasMore && <PanelSectionRow><ButtonItem layout="below" onClick={() => void loadMoreHistory()}><span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>Load more messages</span></ButtonItem></PanelSectionRow>}
           {displayedHistory.map((message) => (
-            <PanelSectionRow key={message.id}>
+            <Fragment key={message.id}>
+            <PanelSectionRow>
               <div tabIndex={0} onFocusCapture={() => setFocusedMessageId(message.id)} onKeyDown={(event) => { if (event.key.toLowerCase() !== "y" || message.media?.kind !== "audio") return; event.preventDefault(); const audio = audioRefs.current[message.id]; if (!audio) return; if (audio.paused) void audio.play(); else audio.pause(); }} style={{ width: "100%" }}>
                 <ButtonItem layout="below" onClick={() => { console.log("[decky-whatsapp] selected message", { id: message.id, chatId: message.chatId, sender: message.sender }); setSelectedMessageId(message.id); setReplyTarget({ id: message.id, sender: message.fromMe ? "You" : message.sender, body: message.body }); }}>
                   <div style={{ display: "flex", justifyContent: message.fromMe ? "flex-end" : "flex-start", width: "100%" }}>
                     <div style={{ position: "relative", maxWidth: "88%", padding: "10px 12px", borderRadius: message.fromMe ? "14px 14px 4px 14px" : "14px 14px 14px 4px", background: message.fromMe ? "rgba(55, 128, 108, 0.5)" : "rgba(255,255,255,0.11)", border: selectedMessageId === message.id ? "2px solid rgba(126, 211, 181, 0.9)" : "2px solid transparent", textAlign: "left" }}>
-                      {((message.reactions && message.reactions.length > 0) || message.reaction) && <span aria-label="Message reactions" style={{ position: "absolute", top: "-10px", right: "-8px", borderRadius: "14px", minWidth: "28px", minHeight: "28px", padding: "0 5px", display: "flex", alignItems: "center", justifyContent: "center", gap: "2px", background: "#4b2732", fontSize: "16px" }}>{(message.reactions && message.reactions.length > 0 ? message.reactions : [message.reaction]).filter((emoji): emoji is string => Boolean(emoji)).join(" ")}</span>}
+                      {(() => {
+                        const reactions = uniqueReactions(message.reactions && message.reactions.length > 0 ? message.reactions : message.reaction ? [message.reaction] : undefined);
+                        return reactions && <span aria-label="Message reactions" style={{ position: "absolute", top: "-10px", right: "-8px", borderRadius: "14px", minWidth: "28px", minHeight: "28px", padding: "0 5px", display: "flex", alignItems: "center", justifyContent: "center", gap: "2px", background: "#4b2732", fontSize: "16px" }}>{reactions.join(" ")}</span>;
+                      })()}
                       <div style={{ fontSize: "12px", opacity: 0.68, marginBottom: message.body ? "3px" : 0 }}>{message.fromMe ? "You" : message.sender}</div>
                       {message.body && <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.3 }}>{message.body}</div>}
                       {renderMedia(message)}
-                      <div style={{ fontSize: "10px", opacity: 0.48, marginTop: "6px", textAlign: "right" }}>{new Date(message.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}{message.fromMe && message.ack !== undefined ? ` · ${message.ack >= 3 ? "✓✓" : "✓"}` : ""}</div>
+                      <div style={{ fontSize: "10px", opacity: 0.58, marginTop: "6px", textAlign: "right" }}>
+                        {new Date(message.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                        {message.fromMe && <span title={messageStatus(message.ack).label} aria-label={messageStatus(message.ack).label} style={{ marginLeft: "5px", color: messageStatus(message.ack).color, fontWeight: 700 }}>{messageStatus(message.ack).symbol}</span>}
+                      </div>
                     </div>
                   </div>
                 </ButtonItem>
               </div>
             </PanelSectionRow>
+            {selectedMessageId === message.id && message.fromMe && <PanelSectionRow><div style={{ display: "flex", gap: "8px", width: "100%" }}>
+              {message.ack === -1 && <ButtonItem layout="below" disabled={messageActionId === message.id} onClick={() => void retryMessage(message)}>Retry message</ButtonItem>}
+              {!message.id.startsWith("local-failed-") && !message.body.startsWith("[Message deleted]") && <ButtonItem layout="below" disabled={messageActionId === message.id} onClick={() => void deleteMessage(message)}>Delete for everyone</ButtonItem>}
+            </div></PanelSectionRow>}
+            </Fragment>
           ))}
           <div ref={conversationEndRef} tabIndex={-1} aria-hidden="true" style={{ height: "1px", outline: "none" }} />
           <PanelSectionRow>
             {replyTarget && <div style={{ marginBottom: "8px", padding: "8px 10px", borderLeft: "3px solid #63d2ad", background: "rgba(255,255,255,0.08)", borderRadius: "4px" }}><div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", opacity: 0.8 }}><FaReply /> Replying to {replyTarget.sender}</div><div style={{ opacity: 0.65, fontSize: "12px", marginTop: "3px" }}>{replyTarget.body.slice(0, 120)}</div><ButtonItem layout="below" onClick={() => setReplyTarget(undefined)}>Cancel reply</ButtonItem></div>}
-            <TextField key={replyTarget?.id || "new-reply"} label="Reply" value={reply} focusOnMount={Boolean(replyTarget)} onChange={(value) => setReply(inputValue(value))} />
+            <TextField key={replyTarget?.id || "new-reply"} label="Reply" value={reply} focusOnMount={Boolean(replyTarget)} onFocus={() => { replyInputActive.current = true; }} onBlur={() => { replyInputActive.current = false; }} onChange={(value) => setReply(inputValue(value))} />
           </PanelSectionRow>
-          <PanelSectionRow><div style={{ display: "flex", flexDirection: "column", gap: "8px", width: "100%" }}><ButtonItem layout="below" onClick={() => void sendReply()}><span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}><FaPaperPlane /> Send reply</span></ButtonItem><ButtonItem layout="below" onClick={startVoiceTyping}><span style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "center", fontSize: "24px" }}>{voiceState === "recording" ? <FaStop aria-label="Stop recording" /> : <FaMicrophone aria-label="Voice typing" />}</span></ButtonItem></div></PanelSectionRow>
+          <PanelSectionRow><div style={{ display: "flex", flexDirection: "column", gap: "8px", width: "100%" }}><ButtonItem layout="below" onClick={() => void sendReply()}><span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}><FaPaperPlane /> Send reply</span></ButtonItem><ButtonItem layout="below" disabled={voiceTypingAvailable === false} onClick={startVoiceTyping}><span style={{ display: "flex", width: "100%", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "4px", fontSize: "24px", opacity: voiceTypingAvailable === false ? 0.5 : 1 }}>{voiceState === "recording" ? <FaStop aria-label="Stop recording" /> : <FaMicrophone aria-label="Voice typing" />}<span style={{ fontSize: "11px" }}>{voiceState === "recording" ? "Stop recording" : voiceTypingAvailable === false ? "Whisper not installed" : voiceState === "transcribing" ? "Transcribing…" : "Voice typing"}</span></span></ButtonItem></div></PanelSectionRow>
         </PanelSection>
       )}
     </>
@@ -998,9 +1169,11 @@ export default definePlugin(() => ({
   title: <div>WhatsApp</div>,
   content: <WhatsAppPanel />,
   icon: <FaWhatsapp />,
-  onDismount: () => stopBackgroundNotifications()
+  onDismount: () => {
+    const keepNotifications =
+      window.localStorage.getItem("decky-whatsapp-enabled") === "true" &&
+      window.localStorage.getItem("decky-whatsapp-notifications-enabled") !== "false" &&
+      window.localStorage.getItem("decky-whatsapp-notifications-while-gaming") !== "false";
+    if (!keepNotifications) stopBackgroundNotifications();
+  }
 }));
-
-if (window.localStorage.getItem("decky-whatsapp-enabled") === "true") {
-  startBackgroundNotifications();
-}

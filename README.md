@@ -38,24 +38,76 @@ The bridge uses a pinned `whatsapp-web.js` revision and a small compatibility
 patch because WhatsApp Web changes over time. Third-party packages and bundled
 components remain subject to their own licenses and terms.
 
-## PC setup
+## First download: install and start the release
 
-From PowerShell, open the project directory and install the dependencies:
+Download both release archives:
+
+Extract the PC release ZIP to a permanent folder on the Windows PC. Keep all
+of its files together. Install the Decky plugin release ZIP through Decky
+Loader.
+
+### Automatic setup
+
+This is the recommended path for most users.
+
+1. Open PowerShell in the extracted PC package folder and run:
 
 ```powershell
-cd C:\Users\YOUR_USER\Desktop\DeckyWhatsapp
-npm install
+powershell -ExecutionPolicy Bypass -File .\install-decky-whatsapp-windows.ps1
 ```
 
-The easiest way to start the bridge and its SSH tunnel is:
+The installer checks for Node.js and Windows OpenSSH, installs the PC bridge
+dependencies, creates the SSH key used by the launcher, and creates shortcuts.
+If Node.js is missing and `winget` is available, it can install Node.js LTS
+automatically.
+
+2. Install the public SSH key on the Deck if you want passwordless startup:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-decky-whatsapp-windows.ps1 -InstallDeckKey
+```
+
+Enter the Deck hostname or IP when prompted. The Deck password may be needed
+once during this step.
+
+3. Start the system from the created **Decky WhatsApp** shortcut, or run:
 
 ```powershell
 .\start-decky-whatsapp.bat
 ```
 
-The first WhatsApp Web start may ask you to link the device by scanning a QR
-code. The linked session is stored locally in `.wwebjs_auth/`. This directory
-contains private WhatsApp session data and should be kept private.
+Keep the bridge and tunnel windows open while using the plugin. On the first
+start, link WhatsApp Web by scanning the QR code if requested. The session is
+then stored locally on the PC.
+
+### Manual setup
+
+Use this path if you prefer to install prerequisites and start each component
+yourself.
+
+1. Install Node.js 20 or newer and ensure Windows OpenSSH is available.
+2. Open PowerShell in the extracted PC package folder and install dependencies:
+
+```powershell
+cd C:\Path\To\decky-whatsapp-pc
+npm.cmd install
+```
+
+3. Start the PC bridge in one PowerShell window:
+
+```powershell
+.\node_modules\.bin\tsx.cmd src/server.ts
+```
+
+4. In a second PowerShell window, start the SSH reverse tunnel:
+
+```powershell
+ssh -N -T -o ExitOnForwardFailure=yes -R 8787:127.0.0.1:8787 deck@STEAM_DECK_IP
+```
+
+Keep both windows open while using the plugin. The first WhatsApp Web start
+may ask you to link the device by scanning a QR code. The linked session is
+stored locally in `.wwebjs_auth/`; keep that directory private.
 
 ## Install the Decky plugin
 
@@ -69,13 +121,26 @@ http://127.0.0.1:8787
 On the Deck, that address is provided by the SSH reverse tunnel described
 below.
 
-## Optional voice typing
+## Optional voice typing (BETA)
 
-Voice typing is optional and is not required for normal text messaging,
-contacts, media, or voice message playback. If you want to dictate replies,
-install the Deck-local Whisper engine using the separate voice installation
-instructions. The setup requires both the Whisper executable and its model
-file.
+Voice typing is an optional **beta feature** and is not required for normal text
+messaging, contacts, media, or voice message playback. Its functionality is
+not guaranteed at this stage. Transcription accuracy, microphone support, and
+compatibility may vary between Steam Deck setups.
+
+If you want to test dictation, install Whisper separately on the Steam Deck
+before using the voice typing button. The plugin checks for Whisper at runtime
+and continues working normally when it is not installed.
+
+The project includes [install-whisper-deck.sh](./install-whisper-deck.sh) as an
+optional beta convenience installer. Run it only if you want to test voice
+recognition. It may ask for your Deck password, temporarily unlock SteamOS
+while installing build tools, restore read-only mode, build Whisper locally,
+and download its speech model. This requires an internet connection and
+several hundred megabytes of temporary and model storage.
+
+Voice recordings are transcribed locally on the Deck. The installer does not
+install a Whisper server and does not require Git.
 
 ## SSH reverse tunnel
 
