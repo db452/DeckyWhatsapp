@@ -2,7 +2,7 @@
   "name": "decky-whatsapp-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "PC-side WhatsApp Web bridge for a future Steam Deck Decky plugin.",
+  "description": "PC-side WhatsApp Web bridge for a Steam Deck Decky plugin.",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",

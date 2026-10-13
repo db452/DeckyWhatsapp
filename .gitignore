@@ -15,5 +15,6 @@ bridge-token*
 .vscode/
 .idea/
 *.code-workspace
+releases/
 .DS_Store
 Thumbs.db

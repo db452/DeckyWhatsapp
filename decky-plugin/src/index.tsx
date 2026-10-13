@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
 type BridgeStatus = "starting" | "qr_required" | "authenticated" | "ready" | "disconnected" | "auth_failure" | "disabled" | "unknown";
+type SocketState = "connected" | "connecting" | "disconnected" | "disabled" | "unknown";
 
 type IncomingMessage = {
   id: string;
@@ -14,6 +15,8 @@ type IncomingMessage = {
   body: string;
   timestamp: number;
   fromMe: boolean;
+  ack?: number;
+  mediaKind?: "image" | "sticker" | "gif" | "audio";
   reaction?: string;
   reactions?: string[];
   image?: {
@@ -40,7 +43,10 @@ type ChatSummary = {
 
 type BridgeEvent =
   | { type: "status"; status: BridgeStatus }
-  | { type: "message"; message: IncomingMessage };
+  | { type: "message"; message: IncomingMessage }
+  | { type: "message_update"; update: "edited" | "deleted"; message: IncomingMessage }
+  | { type: "message_ack"; chatId: string; messageId: string; ack: number }
+  | { type: "reaction"; chatId: string; messageId: string; emoji: string; fromMe: boolean };
 
 type ReplyTarget = {
   id: string;
@@ -117,6 +123,10 @@ function errorMessage(value: unknown): string {
     }
   }
   return String(value);
+}
+
+function formatDiagnosticTime(value?: number): string {
+  return value ? new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "Never";
 }
 
 async function getBridgeToken(httpUrl: string): Promise<string> {
@@ -270,10 +280,16 @@ function WhatsAppPanel() {
   const [bridgeUrl, setBridgeUrl] = useState(defaultBridgeUrl);
   const [enabled, setEnabled] = useState(() => window.localStorage.getItem("decky-whatsapp-enabled") === "true");
   const [status, setStatus] = useState<BridgeStatus>("unknown");
+  const [socketState, setSocketState] = useState<SocketState>("unknown");
+  const [statusUpdatedAt, setStatusUpdatedAt] = useState<number>();
+  const [lastHealthCheckAt, setLastHealthCheckAt] = useState<number>();
+  const [lastError, setLastError] = useState("");
+  const [connectionRefresh, setConnectionRefresh] = useState(0);
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [selectedChat, setSelectedChat] = useState<ChatSummary | undefined>();
   const [selectedChatId, setSelectedChatId] = useState("");
   const [history, setHistory] = useState<IncomingMessage[]>([]);
+  const [historyRefresh, setHistoryRefresh] = useState(0);
   const [ownReactions, setOwnReactions] = useState<Record<string, string | null>>({});
   const [selectedMessageId, setSelectedMessageId] = useState("");
   const [focusedMessageId, setFocusedMessageId] = useState("");
@@ -283,6 +299,7 @@ function WhatsAppPanel() {
   const [error, setError] = useState("");
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "transcribing">("idle");
   const [showSettings, setShowSettings] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [shuttingDown, setShuttingDown] = useState(false);
   const [compactHistory, setCompactHistory] = useState(() => window.localStorage.getItem("decky-whatsapp-compact-history") !== "false");
   const [historyExpanded, setHistoryExpanded] = useState(false);
@@ -303,6 +320,24 @@ function WhatsAppPanel() {
   const bridgeHealthFailures = useRef(0);
 
   const normalizedBridgeUrl = useMemo(() => bridgeUrl.replace(/\/$/, ""), [bridgeUrl]);
+
+  const updateStatus = (nextStatus: BridgeStatus) => {
+    setStatus(nextStatus);
+    setStatusUpdatedAt(Date.now());
+  };
+
+  const reportError = (message: string) => {
+    setError(message);
+    setLastError(message);
+  };
+
+  const mergeOwnReactions = (messages: IncomingMessage[]) => messages.map((message) => {
+    if (!Object.prototype.hasOwnProperty.call(ownReactions, message.id)) return message;
+    const ownReaction = ownReactions[message.id];
+    const otherReactions = (message.reactions || []).filter((reaction) => reaction !== reactionEmoji && reaction !== ownReaction);
+    const reactions = ownReaction ? [...new Set([...otherReactions, ownReaction])] : otherReactions;
+    return { ...message, reaction: ownReaction || undefined, reactions: reactions.length > 0 ? reactions : undefined };
+  });
 
   useEffect(() => {
     window.localStorage.setItem("decky-whatsapp-contact-mode", contactMode);
@@ -327,12 +362,45 @@ function WhatsAppPanel() {
   }, [chats, contactMode]);
 
   useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    const profileQueue = [...visibleChats];
+    const loadProfiles = async () => {
+      while (!cancelled) {
+        const chat = profileQueue.shift();
+        if (!chat) return;
+        if (Object.prototype.hasOwnProperty.call(profilePicCache.current, chat.chatId) || profilePicRequests.current.has(chat.chatId)) continue;
+        profilePicRequests.current.add(chat.chatId);
+        try {
+          const profileResponse = await bridgeFetch(`${normalizedBridgeUrl}/chats/${encodeURIComponent(chat.chatId)}/profile`);
+          if (!profileResponse.ok) {
+            continue;
+          }
+          const profile = await profileResponse.json() as { profilePicUrl?: string | null };
+          profilePicCache.current[chat.chatId] = profile.profilePicUrl || null;
+          if (cancelled || !profile.profilePicUrl) continue;
+          setChats((current) => current.map((item) => item.chatId === chat.chatId ? { ...item, profilePicUrl: profile.profilePicUrl || undefined } : item));
+        } catch {
+          // Profile pictures are optional and must not affect synchronization.
+        } finally {
+          profilePicRequests.current.delete(chat.chatId);
+        }
+      }
+    };
+    void Promise.all(Array.from({ length: 4 }, () => loadProfiles()));
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, normalizedBridgeUrl, visibleChats]);
+
+  useEffect(() => {
     let socket: WebSocket | undefined;
     let reconnectTimer: number | undefined;
     let cancelled = false;
 
     if (!enabled) {
-      setStatus("disabled");
+      updateStatus("disabled");
+      setSocketState("disabled");
       setChats([]);
       setSelectedChat(undefined);
       setSelectedChatId("");
@@ -352,31 +420,6 @@ function WhatsAppPanel() {
             ...chat,
             profilePicUrl: profilePicCache.current[chat.chatId] || undefined
           })));
-          const profileQueue = [...result.chats];
-          const loadProfiles = async () => {
-            while (!cancelled) {
-              const chat = profileQueue.shift();
-              if (!chat) return;
-              if (Object.prototype.hasOwnProperty.call(profilePicCache.current, chat.chatId) || profilePicRequests.current.has(chat.chatId)) continue;
-              profilePicRequests.current.add(chat.chatId);
-              try {
-                const profileResponse = await bridgeFetch(`${normalizedBridgeUrl}/chats/${encodeURIComponent(chat.chatId)}/profile`);
-                if (!profileResponse.ok) {
-                  profilePicCache.current[chat.chatId] = null;
-                  continue;
-                }
-                const profile = await profileResponse.json() as { profilePicUrl?: string | null };
-                profilePicCache.current[chat.chatId] = profile.profilePicUrl || null;
-                if (cancelled || !profile.profilePicUrl) continue;
-                setChats((current) => current.map((item) => item.chatId === chat.chatId ? { ...item, profilePicUrl: profile.profilePicUrl || undefined } : item));
-              } catch {
-                // Profile pictures are optional and must not affect the contact list.
-              } finally {
-                profilePicRequests.current.delete(chat.chatId);
-              }
-            }
-          };
-          void Promise.all(Array.from({ length: 4 }, () => loadProfiles()));
         }
       } catch (loadError) {
         console.error("[decky-whatsapp] contacts request failed", loadError);
@@ -391,15 +434,16 @@ function WhatsAppPanel() {
         const health = await response.json() as { status: BridgeStatus };
         if (!cancelled) {
           bridgeHealthFailures.current = 0;
-          setStatus(health.status);
+          updateStatus(health.status);
+          setLastHealthCheckAt(Date.now());
           setError("");
         }
       } catch {
         if (!cancelled) {
           bridgeHealthFailures.current += 1;
           if (bridgeHealthFailures.current >= 3) {
-            setStatus("unknown");
-            setError("Bridge unavailable; retrying connection…");
+            updateStatus("unknown");
+            reportError("Bridge unavailable; retrying connection…");
           }
         }
       }
@@ -412,16 +456,22 @@ function WhatsAppPanel() {
           chatId: incoming.chatId,
           chatName: incoming.chatName,
           profilePicUrl: existing?.profilePicUrl,
-          receivedSinceSession: true,
+          receivedSinceSession: existing?.receivedSinceSession || !incoming.fromMe,
           lastMessage: incoming.body,
           timestamp: incoming.timestamp,
-          unreadCount: existing?.unreadCount ?? 0
+          unreadCount: existing ? existing.unreadCount + (incoming.fromMe || incoming.chatId === selectedChatId ? 0 : 1) : (incoming.fromMe ? 0 : 1)
         };
-        return [updated, ...current.filter((chat) => chat.chatId !== incoming.chatId)].slice(0, 5);
+        return [updated, ...current.filter((chat) => chat.chatId !== incoming.chatId)];
       });
       if (incoming.chatId === selectedChatId) {
         setHistory((current) => current.some((message) => message.id === incoming.id) ? current : [...current, incoming]);
       }
+    };
+
+    const updateChatPreview = (message: IncomingMessage) => {
+      setChats((current) => current.map((chat) => chat.chatId === message.chatId && message.timestamp >= chat.timestamp
+        ? { ...chat, chatName: message.chatName, lastMessage: message.body, timestamp: message.timestamp }
+        : chat));
     };
 
     const scheduleReconnect = () => {
@@ -433,33 +483,67 @@ function WhatsAppPanel() {
     };
 
     const connect = async () => {
+      if (!cancelled) setSocketState("connecting");
       try {
         const response = await bridgeFetch(`${normalizedBridgeUrl}/health`);
         const health = await response.json() as { status: BridgeStatus };
-        if (!cancelled) setStatus(health.status);
+        if (!cancelled) {
+          updateStatus(health.status);
+          setLastHealthCheckAt(Date.now());
+        }
         await loadChats();
         socket = new WebSocket(await bridgeWebSocketUrl(normalizedBridgeUrl));
+        socket.onopen = () => {
+          if (!cancelled) setSocketState("connected");
+        };
         socket.onmessage = (event) => {
           const message = JSON.parse(event.data) as BridgeEvent;
-          if (message.type === "status") setStatus(message.status);
+          if (message.type === "status") updateStatus(message.status);
           if (message.type === "message") {
             addMessage(message.message);
+            if (message.message.chatId === selectedChatId && message.message.mediaKind) setHistoryRefresh((current) => current + 1);
+          }
+          if (message.type === "message_update") {
+            updateChatPreview(message.message);
+            setHistory((current) => current.map((existing) => existing.id === message.message.id ? { ...existing, ...message.message } : existing));
+          }
+          if (message.type === "message_ack") {
+            setHistory((current) => current.map((existing) => existing.id === message.messageId ? { ...existing, ack: message.ack } : existing));
+          }
+          if (message.type === "reaction") {
+            setHistory((current) => current.map((existing) => {
+              if (existing.id !== message.messageId) return existing;
+              const ownReaction = message.fromMe ? (message.emoji || existing.reaction) : existing.reaction;
+              const reactions = [...(existing.reactions || [])];
+              if (message.emoji && !reactions.includes(message.emoji)) reactions.push(message.emoji);
+              if (message.fromMe && !message.emoji && ownReaction) {
+                const index = reactions.indexOf(ownReaction);
+                if (index >= 0) reactions.splice(index, 1);
+              }
+              return { ...existing, reaction: message.fromMe ? (message.emoji || undefined) : existing.reaction, reactions: reactions.length ? reactions : undefined };
+            }));
+            if (message.fromMe) setOwnReactions((current) => ({ ...current, [message.messageId]: message.emoji || null }));
           }
         };
-        socket.onerror = () => setError("Unable to connect to the bridge");
+        socket.onerror = () => {
+          setSocketState("disconnected");
+          reportError("Unable to connect to the bridge");
+        };
         socket.onclose = () => {
           if (!cancelled) {
+            setSocketState("disconnected");
             resetBridgeToken();
-            setError("Bridge connection lost; retrying…");
+            reportError("Bridge connection lost; retrying…");
             scheduleReconnect();
           }
         };
       } catch {
         if (!cancelled) {
+          setSocketState("disconnected");
           bridgeHealthFailures.current += 1;
           if (bridgeHealthFailures.current >= 3) {
-            setStatus("unknown");
-            setError("Bridge unavailable; retrying connection…");
+            updateStatus("unknown");
+            reportError("Bridge unavailable; retrying connection…");
           }
         }
         scheduleReconnect();
@@ -469,15 +553,37 @@ function WhatsAppPanel() {
     void connect();
     const polling = window.setInterval(() => {
       void refreshBridgeStatus();
-      void loadChats();
-    }, 15000);
+      // WebSocket events are the primary synchronization path. Only refresh
+      // the full chat list when the socket is not currently connected.
+      if (!socket || socket.readyState !== WebSocket.OPEN) void loadChats();
+    }, 60000);
     return () => {
       cancelled = true;
       window.clearInterval(polling);
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [enabled, normalizedBridgeUrl]);
+  }, [enabled, normalizedBridgeUrl, connectionRefresh]);
+
+  useEffect(() => {
+    if (!selectedChatId || historyRefresh === 0) return;
+    let cancelled = false;
+    const refreshActiveHistory = async () => {
+      try {
+        const limit = compactHistory && !historyExpanded ? 5 : 50;
+        const response = await bridgeFetch(`${normalizedBridgeUrl}/chats/${encodeURIComponent(selectedChatId)}/messages?limit=${limit}`);
+        if (!response.ok) return;
+        const result = await response.json() as { messages: IncomingMessage[] };
+        if (!cancelled) setHistory(mergeOwnReactions(result.messages));
+      } catch {
+        // The normal connection recovery path will retry the next update.
+      }
+    };
+    void refreshActiveHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, [historyRefresh, selectedChatId, normalizedBridgeUrl, compactHistory, historyExpanded]);
 
   useEffect(() => {
     if (!selectedChatId || historyLoading) return;
@@ -558,6 +664,13 @@ function WhatsAppPanel() {
     setError("");
   };
 
+  const reconnectFromDiagnostics = () => {
+    bridgeHealthFailures.current = 0;
+    setError("");
+    setSocketState("connecting");
+    setConnectionRefresh((current) => current + 1);
+  };
+
   const shutdownAll = async () => {
     stopBackgroundNotifications();
     if (voiceSession.current) {
@@ -589,13 +702,7 @@ function WhatsAppPanel() {
       throw new Error(`History request failed (${response.status}): ${details?.error || "unknown bridge error"}`);
     }
     const result = await response.json() as { messages: IncomingMessage[]; hasMore?: boolean };
-    setHistory(result.messages.map((message) => {
-      if (!Object.prototype.hasOwnProperty.call(ownReactions, message.id)) return message;
-      const ownReaction = ownReactions[message.id];
-      const otherReactions = (message.reactions || []).filter((reaction) => reaction !== reactionEmoji && reaction !== ownReaction);
-      const reactions = ownReaction ? [...new Set([...otherReactions, ownReaction])] : otherReactions;
-      return { ...message, reaction: ownReaction || undefined, reactions: reactions.length > 0 ? reactions : undefined };
-    }));
+    setHistory(mergeOwnReactions(result.messages));
     setHistoryHasMore(Boolean(result.hasMore));
   };
 
@@ -611,7 +718,7 @@ function WhatsAppPanel() {
     try {
       await loadHistory(chat.chatId, compactHistory ? 5 : 50);
     } catch (selectionError) {
-      setError(selectionError instanceof Error ? selectionError.message : "Unable to load conversation history");
+      reportError(selectionError instanceof Error ? selectionError.message : "Unable to load conversation history");
     } finally {
       setHistoryLoading(false);
     }
@@ -624,7 +731,7 @@ function WhatsAppPanel() {
     try {
       await loadHistory(selectedChatId, 50);
     } catch {
-      setError("Older messages could not be loaded");
+      reportError("Older messages could not be loaded");
       setHistoryExpanded(false);
     } finally {
       setHistoryLoading(false);
@@ -648,7 +755,7 @@ function WhatsAppPanel() {
     } catch (sendError) {
       const message = sendError instanceof Error ? sendError.message : "Message could not be sent";
       console.error("[decky-whatsapp] send failed", sendError);
-      setError(message);
+      reportError(message);
       return;
     }
 
@@ -658,7 +765,7 @@ function WhatsAppPanel() {
     try {
       await loadHistory(selectedChatId, compactHistory && !historyExpanded ? 5 : 50);
     } catch {
-      setError("Message was sent, but the conversation could not be refreshed");
+      reportError("Message was sent, but the conversation could not be refreshed");
     } finally {
       setHistoryLoading(false);
     }
@@ -686,7 +793,7 @@ function WhatsAppPanel() {
     } catch (reactionError) {
       const message = reactionError instanceof Error ? reactionError.message : "Reaction could not be sent";
       console.error("[decky-whatsapp] reaction failed", reactionError);
-      setError(message);
+      reportError(message);
     }
   };
 
@@ -727,7 +834,7 @@ function WhatsAppPanel() {
         toaster.toast({ title: "Voice typing", body: "Text added to your reply", duration: 3000 });
       } catch (voiceError) {
         const message = errorMessage(voiceError);
-        setError(message);
+        reportError(message);
         toaster.toast({ title: "Voice typing failed", body: message, duration: 6000 });
       } finally {
         setVoiceState("idle");
@@ -754,7 +861,7 @@ function WhatsAppPanel() {
       setVoiceState("recording");
       toaster.toast({ title: "Voice typing", body: "Recording… press the microphone again to stop", duration: 3000 });
     } catch (voiceError) {
-      setError(voiceError instanceof Error ? voiceError.message : "Microphone access failed");
+      reportError(voiceError instanceof Error ? voiceError.message : "Microphone access failed");
     }
   };
 
@@ -795,7 +902,7 @@ function WhatsAppPanel() {
         <PanelSectionRow><ButtonItem layout="below" onClick={() => void toggleEnabled()}>{enabled ? "Stop Decky WhatsApp" : "Start Decky WhatsApp"}</ButtonItem></PanelSectionRow>
         {error && <PanelSectionRow><div style={{ color: "#ff8d8d", fontSize: "13px" }}>{error}</div></PanelSectionRow>}
       </PanelSection>
-      {!selectedChatId && !showSettings && (
+      {!selectedChatId && !showSettings && !showDiagnostics && (
         <PanelSection title={`Contacts (${visibleChats.length})`}>
           {visibleChats.length === 0 && <PanelSectionRow><div style={{ opacity: 0.7, padding: "12px 0" }}>No contacts found for this setting</div></PanelSectionRow>}
           {visibleChats.map((chat) => (
@@ -815,7 +922,7 @@ function WhatsAppPanel() {
           <PanelSectionRow><ButtonItem layout="below" onClick={() => setShowSettings(true)}><span style={{ display: "flex", alignItems: "center", gap: "10px" }}><FaCog /> Settings</span></ButtonItem></PanelSectionRow>
         </PanelSection>
       )}
-      {!selectedChatId && showSettings && (
+      {!selectedChatId && showSettings && !showDiagnostics && (
         <PanelSection title="Settings">
           <PanelSectionRow><div style={{ opacity: 0.7, fontSize: "13px", padding: "4px 0 8px" }}>Choose how your WhatsApp contacts are arranged.</div></PanelSectionRow>
           <PanelSectionRow><div style={{ opacity: 0.7, fontSize: "13px", padding: "8px 0 2px" }}>Select default reaction (press x)</div></PanelSectionRow>
@@ -831,7 +938,23 @@ function WhatsAppPanel() {
             </PanelSectionRow>
           ))}
           <PanelSectionRow><ButtonItem layout="below" onClick={() => setCompactHistory((current) => !current)}><div style={{ display: "flex", alignItems: "center", gap: "12px", textAlign: "left" }}><FaClock /><div><div><strong>{compactHistory ? "✓ " : ""}Show only the last 5 messages</strong></div><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Keep conversations compact and load older messages on demand.</div></div></div></ButtonItem></PanelSectionRow>
+          <PanelSectionRow><ButtonItem layout="below" onClick={() => setShowDiagnostics(true)}><span style={{ display: "flex", alignItems: "center", gap: "10px" }}>Diagnostics</span></ButtonItem></PanelSectionRow>
           <PanelSectionRow><ButtonItem layout="below" onClick={() => setShowSettings(false)}><span style={{ display: "flex", alignItems: "center", gap: "10px" }}><FaArrowLeft /> Back to contacts</span></ButtonItem></PanelSectionRow>
+        </PanelSection>
+      )}
+      {!selectedChatId && showDiagnostics && (
+        <PanelSection title="Diagnostics">
+          <PanelSectionRow><div style={{ opacity: 0.7, fontSize: "13px", padding: "4px 0 8px" }}>Connection details for troubleshooting Decky WhatsApp.</div></PanelSectionRow>
+          <PanelSectionRow><div><strong>Plugin</strong><div style={{ opacity: 0.65, fontSize: "12px", marginTop: "3px" }}>{enabled ? "Enabled" : "Disabled"}</div></div></PanelSectionRow>
+          <PanelSectionRow><div><strong>Bridge HTTP</strong><div style={{ opacity: 0.65, fontSize: "12px", marginTop: "3px" }}>{socketState === "connected" ? "Reachable" : socketState === "connecting" ? "Checking…" : socketState === "disabled" ? "Disabled" : "Unavailable"}</div></div></PanelSectionRow>
+          <PanelSectionRow><div><strong>WebSocket tunnel</strong><div style={{ opacity: 0.65, fontSize: "12px", marginTop: "3px" }}>{socketState}</div></div></PanelSectionRow>
+          <PanelSectionRow><div><strong>WhatsApp Web</strong><div style={{ opacity: 0.65, fontSize: "12px", marginTop: "3px" }}>{status}</div></div></PanelSectionRow>
+          <PanelSectionRow><div><strong>Authentication</strong><div style={{ opacity: 0.65, fontSize: "12px", marginTop: "3px" }}>{status === "ready" ? "Authenticated and ready" : status === "authenticated" ? "Authenticated; still starting" : status === "qr_required" ? "QR code required" : status === "auth_failure" ? "Authentication failed" : "Not confirmed"}</div></div></PanelSectionRow>
+          <PanelSectionRow><div><strong>Last status update</strong><div style={{ opacity: 0.65, fontSize: "12px", marginTop: "3px" }}>{formatDiagnosticTime(statusUpdatedAt)}</div></div></PanelSectionRow>
+          <PanelSectionRow><div><strong>Last health check</strong><div style={{ opacity: 0.65, fontSize: "12px", marginTop: "3px" }}>{formatDiagnosticTime(lastHealthCheckAt)}</div></div></PanelSectionRow>
+          <PanelSectionRow><div><strong>Last error</strong><div style={{ opacity: lastError ? 0.85 : 0.55, color: lastError ? "#ff9b9b" : undefined, fontSize: "12px", marginTop: "3px", whiteSpace: "pre-wrap" }}>{lastError || "None recorded"}</div></div></PanelSectionRow>
+          <PanelSectionRow><ButtonItem layout="below" onClick={reconnectFromDiagnostics}><span style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>Reconnect</span></ButtonItem></PanelSectionRow>
+          <PanelSectionRow><ButtonItem layout="below" onClick={() => { setShowDiagnostics(false); setShowSettings(true); }}><span style={{ display: "flex", alignItems: "center", gap: "10px" }}><FaArrowLeft /> Back to settings</span></ButtonItem></PanelSectionRow>
         </PanelSection>
       )}
       {selectedChatId && (
@@ -851,7 +974,7 @@ function WhatsAppPanel() {
                       <div style={{ fontSize: "12px", opacity: 0.68, marginBottom: message.body ? "3px" : 0 }}>{message.fromMe ? "You" : message.sender}</div>
                       {message.body && <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.3 }}>{message.body}</div>}
                       {renderMedia(message)}
-                      <div style={{ fontSize: "10px", opacity: 0.48, marginTop: "6px", textAlign: "right" }}>{new Date(message.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</div>
+                      <div style={{ fontSize: "10px", opacity: 0.48, marginTop: "6px", textAlign: "right" }}>{new Date(message.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}{message.fromMe && message.ack !== undefined ? ` · ${message.ack >= 3 ? "✓✓" : "✓"}` : ""}</div>
                     </div>
                   </div>
                 </ButtonItem>

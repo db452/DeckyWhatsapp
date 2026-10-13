@@ -9,7 +9,10 @@ export type BridgeStatus =
 export type BridgeEvent =
   | { type: "status"; status: BridgeStatus }
   | { type: "qr"; dataUrl: string }
-  | { type: "message"; message: IncomingMessage };
+  | { type: "message"; message: IncomingMessage }
+  | { type: "message_update"; update: "edited" | "deleted"; message: IncomingMessage }
+  | { type: "message_ack"; chatId: string; messageId: string; ack: number }
+  | { type: "reaction"; chatId: string; messageId: string; emoji: string; fromMe: boolean };
 
 export interface IncomingMessage {
   id: string;
@@ -19,6 +22,8 @@ export interface IncomingMessage {
   body: string;
   timestamp: number;
   fromMe: boolean;
+  ack?: number;
+  mediaKind?: "image" | "sticker" | "gif" | "audio";
   reaction?: string;
   reactions?: string[];
   image?: {

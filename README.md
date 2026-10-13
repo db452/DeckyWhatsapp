@@ -27,6 +27,17 @@ the [Steam Deck SSH setup guide](https://github.com/popsUlfr/steam-deck-tricks/b
 - PC and Steam Deck connected to the same network.
 - SSH access to the Steam Deck as the `deck` user.
 
+## Compatibility
+
+- Windows PC with Node.js 20 or newer.
+- Steam Deck running SteamOS with Decky Loader.
+- A current WhatsApp account with companion-device linking available.
+- The PC and Deck must be able to reach each other on the same local network.
+
+The bridge uses a pinned `whatsapp-web.js` revision and a small compatibility
+patch because WhatsApp Web changes over time. Third-party packages and bundled
+components remain subject to their own licenses and terms.
+
 ## PC setup
 
 From PowerShell, open the project directory and install the dependencies:
@@ -136,11 +147,10 @@ Web can refresh its session and try again.
 ### PowerShell blocks `npm`
 
 If PowerShell reports that `npm.ps1` cannot be loaded because scripts are
-disabled, use the Windows command shim instead:
+disabled while installing the PC dependencies, use the Windows command shim:
 
 ```powershell
 npm.cmd install
-npm.cmd run dev
 ```
 
 Alternatively, run the commands from Command Prompt.
@@ -158,7 +168,14 @@ authors, and it contains no analytics or telemetry service. WhatsApp messages,
 media, contacts, and authentication data are handled on the user’s own PC and
 Steam Deck as part of the local bridge connection.
 
+The project’s original code is licensed under the [MIT License](./LICENSE).
+Third-party dependencies remain subject to their own licenses; see the
+[third-party notices](./docs/THIRD-PARTY-NOTICES.md) for the direct dependencies.
+
 - `.wwebjs_auth/` contains private WhatsApp authentication data; never share it.
 - Bridge tokens and local configuration files should remain private.
 - WhatsApp data is still processed by WhatsApp according to WhatsApp’s own
   service and privacy policies.
+
+See [SECURITY.md](./docs/SECURITY.md) for reporting guidance and a list of data
+that must remain private.

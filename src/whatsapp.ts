@@ -18,6 +18,28 @@ type RuntimeReaction = {
   senders?: Array<{ senderUserJid?: unknown; senderId?: unknown }>;
 };
 
+type RuntimeMessage = {
+  id?: RuntimeMessageId | string;
+  from: string;
+  author?: string;
+  fromMe: boolean;
+  timestamp: number;
+  body?: string;
+  type?: string;
+  hasMedia?: boolean;
+  isGif?: boolean;
+  _data?: Record<string, unknown> & { thumbnail?: string; mimetype?: string; isGif?: boolean };
+  getChat: () => Promise<{ id: { _serialized: string; user?: string }; name?: string }>;
+  getContact: () => Promise<{ name?: string; pushname?: string; shortName?: string; verifiedName?: string }>;
+  downloadMedia: () => Promise<{ mimetype: string; data: string; filename?: string | null } | null | undefined>;
+};
+
+type RuntimeReactionEvent = {
+  msgId?: RuntimeMessageId | string;
+  reaction?: unknown;
+  senderId?: unknown;
+};
+
 function formatMessageBody(
   message: { body?: unknown; type?: unknown; fromMe?: unknown },
   media?: IncomingMessage["media"]
@@ -28,12 +50,22 @@ function formatMessageBody(
     return message.fromMe === true ? "[Outgoing call]" : "[Incoming call]";
   }
 
-  if (media) {
-    return `[${media.kind === "sticker" ? "Sticker" : media.kind === "gif" ? "GIF" : media.kind === "audio" ? "Voice message" : "Image"}]`;
+  const mediaKind = media?.kind || getMediaKind(message);
+  if (mediaKind) {
+    return `[${mediaKind === "sticker" ? "Sticker" : mediaKind === "gif" ? "GIF" : mediaKind === "audio" ? "Voice message" : "Image"}]`;
   }
 
   if (typeof message.body === "string" && message.body.trim()) return message.body;
   return "[System message]";
+}
+
+function getMediaKind(message: { type?: unknown; isGif?: unknown; _data?: { isGif?: unknown } }): NonNullable<IncomingMessage["media"]>["kind"] | undefined {
+  const type = typeof message.type === "string" ? message.type : "";
+  if (type === "sticker") return "sticker";
+  if (type === "gif" || (type === "video" && (message.isGif === true || message._data?.isGif === true))) return "gif";
+  if (type.startsWith("image")) return "image";
+  if (type === "audio" || type === "ptt") return "audio";
+  return undefined;
 }
 
 function getMessageId(message: { id?: RuntimeMessageId | string }, fallback: string): string {
@@ -120,41 +152,132 @@ export class WhatsAppService {
       this.scheduleReconnect();
     });
 
-    this.client.on("message", async (message) => {
-      try {
-        let chatId = message.from;
-        let chatName = message.from;
-        try {
-          const chat = await message.getChat();
-          chatId = chat.id._serialized;
-          chatName = chat.name || message.from;
-        } catch (error) {
-          console.error("Could not load WhatsApp chat metadata; using message sender as chat ID", error);
-        }
-
-        const media = await this.getMedia(message);
-
-        const sender = await this.getSenderName(message);
-        const incoming: IncomingMessage = {
-          id: getMessageId(message, `${chatId}:${message.timestamp}:${message.body}`),
-          chatId,
-          chatName,
-          sender,
-          body: formatMessageBody(message, media),
-          timestamp: message.timestamp,
-          fromMe: message.fromMe,
-          image: media?.kind === "image" ? { dataUrl: media.dataUrl, filename: media.filename } : undefined,
-          media
-        };
-        if (!incoming.fromMe) this.receivedChatIdsSinceSession.add(chatId);
-        this.recentMessages.unshift(incoming);
-        this.recentMessages.splice(50);
-        console.log(`Received WhatsApp message from ${incoming.sender} in ${incoming.chatName}`);
-        this.emit({ type: "message", message: incoming });
-      } catch (error) {
-        console.error("Unable to process incoming WhatsApp message", error);
-      }
+    this.client.on("message", (message) => {
+      void this.publishCreatedMessage(message as unknown as RuntimeMessage);
     });
+
+    this.client.on("message_create", (message) => {
+      // The normal message event covers incoming messages. message_create is
+      // needed for messages sent from the phone or another linked device.
+      if (message.fromMe) void this.publishCreatedMessage(message as unknown as RuntimeMessage);
+    });
+
+    this.client.on("message_edit", (message, newBody) => {
+      void this.publishMessageUpdate(message as unknown as RuntimeMessage, "edited", typeof newBody === "string" ? newBody : undefined);
+    });
+
+    this.client.on("message_revoke_everyone", (message, revokedMessage) => {
+      void this.publishMessageUpdate(
+        (revokedMessage || message) as unknown as RuntimeMessage,
+        "deleted"
+      );
+    });
+
+    this.client.on("message_revoke_me", (message) => {
+      void this.publishMessageUpdate(message as unknown as RuntimeMessage, "deleted");
+    });
+
+    this.client.on("message_ack", (message, ack) => {
+      const runtimeMessage = message as unknown as RuntimeMessage;
+      const messageId = getMessageId(runtimeMessage, "");
+      if (!messageId) return;
+      this.emit({ type: "message_ack", chatId: runtimeMessage.from, messageId, ack: Number(ack) });
+    });
+
+    this.client.on("message_reaction", (reaction) => {
+      const event = reaction as unknown as RuntimeReactionEvent;
+      const messageId = getMessageId({ id: event.msgId }, "");
+      if (!messageId) return;
+      const messageKey = event.msgId;
+      const chatId = typeof messageKey === "object" && messageKey && typeof messageKey.remote === "string"
+        ? messageKey.remote
+        : "";
+      if (!chatId) return;
+      const senderId = typeof event.senderId === "string"
+        ? event.senderId
+        : event.senderId && typeof event.senderId === "object" && "_serialized" in event.senderId
+          ? String((event.senderId as { _serialized?: unknown })._serialized || "")
+          : "";
+      const ownWid = this.client.info?.wid?._serialized;
+      this.emit({
+        type: "reaction",
+        chatId,
+        messageId,
+        emoji: typeof event.reaction === "string" ? event.reaction : "",
+        fromMe: typeof ownWid === "string" && senderId === ownWid
+      });
+    });
+  }
+
+  private async publishCreatedMessage(message: RuntimeMessage): Promise<void> {
+    try {
+      let chatId = message.from;
+      let chatName = message.from;
+      try {
+        const chat = await message.getChat();
+        chatId = chat.id._serialized;
+        chatName = chat.name || chat.id.user || message.from;
+      } catch (error) {
+        console.error("Could not load WhatsApp chat metadata; using message sender as chat ID", error);
+      }
+
+      // Keep background synchronization lightweight. Full media is fetched
+      // only when the Deck opens or refreshes the conversation history.
+      const media = undefined;
+      const sender = await this.getSenderName(message);
+      const incoming: IncomingMessage = {
+        id: getMessageId(message, `${chatId}:${message.timestamp}:${message.body || ""}`),
+        chatId,
+        chatName,
+        sender,
+        body: formatMessageBody(message, media),
+        timestamp: message.timestamp,
+        fromMe: message.fromMe,
+        mediaKind: getMediaKind(message),
+        image: undefined,
+        media: undefined
+      };
+      if (!incoming.fromMe) this.receivedChatIdsSinceSession.add(chatId);
+      this.recentMessages.unshift(incoming);
+      this.recentMessages.splice(50);
+      console.log(`Synchronized WhatsApp message from ${incoming.sender} in ${incoming.chatName}`);
+      this.emit({ type: "message", message: incoming });
+    } catch (error) {
+      console.error("Unable to synchronize created WhatsApp message", error);
+    }
+  }
+
+  private async publishMessageUpdate(message: RuntimeMessage, update: "edited" | "deleted", body?: string): Promise<void> {
+    try {
+      let chatId = message.from;
+      let chatName = message.from;
+      try {
+        const chat = await message.getChat();
+        chatId = chat.id._serialized;
+        chatName = chat.name || chat.id.user || message.from;
+      } catch (error) {
+        console.warn("Could not load chat metadata while synchronizing message update", error);
+      }
+
+      const media = undefined;
+      const sender = await this.getSenderName(message);
+      const updatedMessage: IncomingMessage = {
+        id: getMessageId(message, `${chatId}:${message.timestamp}:${body || message.body || ""}`),
+        chatId,
+        chatName,
+        sender,
+        body: update === "deleted" ? "[Message deleted]" : (body || formatMessageBody(message, media)),
+        timestamp: message.timestamp,
+        fromMe: message.fromMe,
+        mediaKind: update === "deleted" ? undefined : getMediaKind(message),
+        image: undefined,
+        media: undefined
+      };
+      this.emit({ type: "message_update", update, message: updatedMessage });
+      console.log("Synchronized WhatsApp message update", { update, chatId, messageId: updatedMessage.id });
+    } catch (error) {
+      console.error("Unable to synchronize WhatsApp message update", error);
+    }
   }
 
   onEvent(listener: (event: BridgeEvent) => void): () => void {
@@ -206,13 +329,26 @@ export class WhatsAppService {
     try {
       console.log(`[profile] requesting profile picture for ${chatId}`);
       const profilePicUrl = await this.client.getProfilePicUrl(chatId);
-      this.profilePicCache.set(chatId, profilePicUrl || null);
-      console.log(`[profile] ${chatId}: ${profilePicUrl ? "received" : "none"}`);
-      return profilePicUrl;
+      if (!profilePicUrl) {
+        this.profilePicCache.set(chatId, null);
+        console.log(`[profile] ${chatId}: none`);
+        return undefined;
+      }
+
+      const imageResponse = await fetch(profilePicUrl, { signal: AbortSignal.timeout(10_000) });
+      if (!imageResponse.ok) throw new Error(`profile image request failed (${imageResponse.status})`);
+      const contentType = imageResponse.headers.get("content-type")?.split(";", 1)[0] || "image/jpeg";
+      if (!contentType.startsWith("image/")) throw new Error(`unexpected profile image type: ${contentType}`);
+      const imageData = Buffer.from(await imageResponse.arrayBuffer());
+      if (imageData.length === 0 || imageData.length > 2_000_000) throw new Error("profile image size is invalid");
+
+      const dataUrl = `data:${contentType};base64,${imageData.toString("base64")}`;
+      this.profilePicCache.set(chatId, dataUrl);
+      console.log(`[profile] ${chatId}: received`, { contentType, bytes: imageData.length });
+      return dataUrl;
     } catch (error) {
-      this.profilePicCache.set(chatId, null);
       console.warn(`[profile] lookup failed for ${chatId}`, error);
-      return undefined;
+      throw error;
     }
   }
 
@@ -299,6 +435,7 @@ export class WhatsAppService {
         body: formatMessageBody(message, media),
         timestamp: message.timestamp,
         fromMe: message.fromMe,
+        mediaKind: media?.kind,
         reaction,
         reactions: reactionsList.length > 0 ? reactionsList : undefined,
         image: media?.kind === "image" ? { dataUrl: media.dataUrl, filename: media.filename } : undefined,
@@ -419,7 +556,7 @@ export class WhatsAppService {
     }
   }
 
-  private async getMedia(message: { id?: { _serialized?: string; $1?: string }; hasMedia?: boolean; type?: string; isGif?: boolean; _data?: Record<string, unknown> & { thumbnail?: string; mimetype?: string; isGif?: boolean }; downloadMedia: () => Promise<{ mimetype: string; data: string; filename?: string | null } | null | undefined> }): Promise<IncomingMessage["media"]> {
+  private async getMedia(message: RuntimeMessage): Promise<IncomingMessage["media"]> {
     const isSticker = message.type === "sticker";
     const isGif = message.type === "gif" || (message.type === "video" && (message.isGif === true || message._data?.isGif === true));
     const isImage = message.type?.startsWith("image") === true;
@@ -427,7 +564,7 @@ export class WhatsAppService {
     if (!message.hasMedia || (!isImage && !isSticker && !isGif && !isAudio)) return undefined;
 
     const mediaInfo = {
-      id: message.id?._serialized || message.id?.$1 || "unknown",
+      id: getMessageId(message, "unknown"),
       type: message.type,
       hasMedia: message.hasMedia,
       dataKeys: Object.keys(message._data || {}),

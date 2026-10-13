@@ -1,0 +1,30 @@
+name: Installation or connection help
+description: Get help installing or connecting the PC bridge and Decky plugin
+title: "[Installation]: "
+labels:
+  - installation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not post passwords, SSH private keys, WhatsApp session files, bridge tokens, QR codes, or private message content.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is not working?
+      description: Describe where the setup stops and the exact error message.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup details
+      description: Include your Windows version, Node.js version, SteamOS version, Decky Loader version, and whether the SSH connection works.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact credentials, tokens, session data, message content, names, and IP addresses if you do not want to share them.
+      render: text
