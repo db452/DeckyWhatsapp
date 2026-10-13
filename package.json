@@ -1,0 +1,31 @@
+{
+  "name": "decky-whatsapp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PC-side WhatsApp Web bridge for a future Steam Deck Decky plugin.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "postinstall": "patch-package"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "github:9cb14c1ec0/whatsapp-web.js#957d740c0baadf2b1c78a6b8d6cf62674bc9debe",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.7.2",
+    "@types/qrcode": "^1.5.5",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/ws": "^8.18.1",
+    "patch-package": "^8.0.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

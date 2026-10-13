@@ -1,0 +1,13 @@
+{
+  "name": "Decky WhatsApp",
+  "author": "DeckyWhatsapp",
+  "flags": ["root"],
+  "publish": {
+    "tags": ["messaging"],
+    "description": "Read and reply to WhatsApp messages from Gaming Mode through a PC bridge."
+  },
+  "api_version": 1,
+  "version": "0.1.0",
+  "appkey": "decky-whatsapp",
+  "description": "Read and reply to WhatsApp messages from Gaming Mode through a PC bridge."
+}
