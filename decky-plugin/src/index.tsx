@@ -1,8 +1,9 @@
 import { call, definePlugin, toaster } from "@decky/api";
-import { ButtonItem, PanelSection, PanelSectionRow, TextField } from "@decky/ui";
+import { ButtonItem, PanelSection, PanelSectionRow, Router, TextField } from "@decky/ui";
 import { FaArrowLeft, FaClock, FaCog, FaFilter, FaMicrophone, FaPaperPlane, FaReply, FaSortAlphaDown, FaStop, FaUsers, FaWhatsapp } from "react-icons/fa";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
+import { connectSocket, fetchWithTimeout } from "./connection";
 
 type BridgeStatus = "starting" | "qr_required" | "authenticated" | "ready" | "disconnected" | "auth_failure" | "disabled" | "unknown";
 type SocketState = "connected" | "connecting" | "disconnected" | "disabled" | "unknown";
@@ -16,6 +17,7 @@ type IncomingMessage = {
   timestamp: number;
   fromMe: boolean;
   ack?: number;
+  quotedMessageId?: string;
   mediaKind?: "image" | "sticker" | "gif" | "audio";
   reaction?: string;
   reactions?: string[];
@@ -165,7 +167,7 @@ function isTextEntryFocused(): boolean {
 async function getBridgeToken(httpUrl: string): Promise<string> {
   if (bridgeToken) return bridgeToken;
   if (!bridgeTokenPromise) {
-    bridgeTokenPromise = fetch(`${httpUrl.replace(/\/$/, "")}/bootstrap`, { cache: "no-store" })
+    bridgeTokenPromise = fetchWithTimeout(`${httpUrl.replace(/\/$/, "")}/bootstrap`, { cache: "no-store" }, 10_000)
       .then(async (response) => {
         if (!response.ok) throw new Error(`Bridge bootstrap failed (${response.status})`);
         const result = await response.json() as { token?: unknown };
@@ -198,7 +200,7 @@ async function bridgeFetch(input: RequestInfo | URL, init: RequestInit = {}, ret
   const token = await getBridgeToken(new URL(inputUrl).origin);
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
-  const response = await fetch(input, { ...init, headers });
+  const response = await fetchWithTimeout(input, { ...init, headers });
   if (response.status === 401 && !retrying) {
     resetBridgeToken();
     return bridgeFetch(input, init, true);
@@ -206,18 +208,11 @@ async function bridgeFetch(input: RequestInfo | URL, init: RequestInit = {}, ret
   return response;
 }
 
-let backgroundNotificationSocket: WebSocket | undefined;
-let backgroundNotificationTimer: number | undefined;
-let backgroundNotificationRun = 0;
+let backgroundNotifications: ReturnType<typeof connectSocket> | undefined;
 
 function stopBackgroundNotifications(): void {
-  backgroundNotificationRun += 1;
-  if (backgroundNotificationTimer !== undefined) {
-    window.clearTimeout(backgroundNotificationTimer);
-    backgroundNotificationTimer = undefined;
-  }
-  backgroundNotificationSocket?.close();
-  backgroundNotificationSocket = undefined;
+  backgroundNotifications?.close();
+  backgroundNotifications = undefined;
 }
 
 function startBackgroundNotifications(): void {
@@ -226,21 +221,16 @@ function startBackgroundNotifications(): void {
     window.localStorage.getItem("decky-whatsapp-notifications-enabled") === "false"
   ) return;
 
-  stopBackgroundNotifications();
-  const run = backgroundNotificationRun;
-
-  const connect = async () => {
-    if (
-      run !== backgroundNotificationRun ||
-      window.localStorage.getItem("decky-whatsapp-enabled") !== "true" ||
-      window.localStorage.getItem("decky-whatsapp-notifications-enabled") === "false"
-    ) return;
-    const socket = new WebSocket(await bridgeWebSocketUrl(defaultBridgeUrl));
-    backgroundNotificationSocket = socket;
-    socket.onmessage = (event) => {
+  if (backgroundNotifications) return;
+  backgroundNotifications = connectSocket({
+    url: () => bridgeWebSocketUrl(defaultBridgeUrl),
+    onClose: resetBridgeToken,
+    onError: (error) => console.warn("[decky-whatsapp] notification connection failed; retrying", error),
+    onMessage: (data) => {
       try {
-        const message = JSON.parse(event.data) as BridgeEvent;
+        const message = JSON.parse(data) as BridgeEvent;
         if (message.type !== "message" || message.message.fromMe) return;
+        if (window.localStorage.getItem("decky-whatsapp-notifications-while-gaming") === "false" && Router.MainRunningApp) return;
         const showPreview = window.localStorage.getItem("decky-whatsapp-notification-previews") !== "false";
         const soundEnabled = window.localStorage.getItem("decky-whatsapp-notification-sound") !== "false";
         toaster.toast({
@@ -253,18 +243,8 @@ function startBackgroundNotifications(): void {
       } catch (error) {
         console.warn("[decky-whatsapp] background notification event failed", error);
       }
-    };
-    socket.onclose = () => {
-      if (run !== backgroundNotificationRun) return;
-      resetBridgeToken();
-      backgroundNotificationTimer = window.setTimeout(() => {
-        backgroundNotificationTimer = undefined;
-        connect();
-      }, 2000);
-    };
-  };
-
-  connect();
+    }
+  });
 }
 
 type VoiceSession = {
@@ -339,12 +319,15 @@ function WhatsAppPanel() {
   const [replyTarget, setReplyTarget] = useState<ReplyTarget | undefined>();
   const [historyLoading, setHistoryLoading] = useState(false);
   const [reply, setReply] = useState("");
+  const [sending, setSending] = useState(false);
+  const sendInFlight = useRef(false);
   const replyInputActive = useRef(false);
   const [error, setError] = useState("");
   const [voiceState, setVoiceState] = useState<"idle" | "recording" | "transcribing">("idle");
   const [voiceTypingAvailable, setVoiceTypingAvailable] = useState<boolean | undefined>(undefined);
   const [voiceTypingReason, setVoiceTypingReason] = useState("");
   const [messageActionId, setMessageActionId] = useState("");
+  const actionInFlight = useRef(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [shuttingDown, setShuttingDown] = useState(false);
@@ -364,13 +347,40 @@ function WhatsAppPanel() {
     return saved === "alphabetical" || saved === "recent" || saved === "last5" || saved === "sinceSession" ? saved : "recent";
   });
   const voiceSession = useRef<VoiceSession | undefined>(undefined);
+  const voiceStarting = useRef(false);
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
   const conversationEndRef = useRef<HTMLDivElement | null>(null);
+  const scrollOnOpen = useRef(false);
   const profilePicCache = useRef<Record<string, string | null>>({});
-  const profilePicRequests = useRef(new Set<string>());
   const bridgeHealthFailures = useRef(0);
+  const historyRequest = useRef<AbortController | undefined>(undefined);
+  const panelMounted = useRef(true);
+  const conversationRun = useRef(0);
+  const historyRevision = useRef(0);
 
   selectedChatIdRef.current = selectedChatId;
+
+  const stopRecording = () => {
+    const session = voiceSession.current;
+    voiceSession.current = undefined;
+    if (session) {
+      session.processor.disconnect();
+      session.source.disconnect();
+      session.stream.getTracks().forEach((track) => track.stop());
+      void session.context.close().catch(() => undefined);
+    }
+    return session;
+  };
+
+  useEffect(() => {
+    panelMounted.current = true;
+    return () => {
+      panelMounted.current = false;
+      conversationRun.current += 1;
+      historyRequest.current?.abort();
+      stopRecording();
+    };
+  }, []);
 
   const normalizedBridgeUrl = useMemo(() => bridgeUrl.replace(/\/$/, ""), [bridgeUrl]);
 
@@ -383,14 +393,6 @@ function WhatsAppPanel() {
     setError(message);
     setLastError(message);
   };
-
-  const mergeOwnReactions = (messages: IncomingMessage[]) => messages.map((message) => {
-    if (!Object.prototype.hasOwnProperty.call(ownReactions, message.id)) return message;
-    const ownReaction = ownReactions[message.id];
-    const otherReactions = (message.reactions || []).filter((reaction) => reaction !== reactionEmoji && reaction !== ownReaction);
-    const reactions = ownReaction ? [...otherReactions, ownReaction] : otherReactions;
-    return { ...message, reaction: ownReaction || undefined, reactions: uniqueReactions(reactions) };
-  });
 
   useEffect(() => {
     window.localStorage.setItem("decky-whatsapp-contact-mode", contactMode);
@@ -407,7 +409,7 @@ function WhatsAppPanel() {
   useEffect(() => {
     window.localStorage.setItem("decky-whatsapp-notifications-enabled", String(notificationsEnabled));
     if (notificationsEnabled && enabled) startBackgroundNotifications();
-    else if (!notificationsEnabled) stopBackgroundNotifications();
+    else stopBackgroundNotifications();
   }, [notificationsEnabled, enabled]);
 
   useEffect(() => {
@@ -450,42 +452,47 @@ function WhatsAppPanel() {
     return ordered;
   }, [chats, contactMode]);
 
+  // Avatar updates must not cancel and restart all four workers.
+  const profileChatIds = JSON.stringify(visibleChats.map((chat) => chat.chatId).sort());
+
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || status !== "ready" || selectedChatId || showSettings || showDiagnostics) return;
     let cancelled = false;
-    const profileQueue = [...visibleChats];
+    const controller = new AbortController();
+    const profileQueue = JSON.parse(profileChatIds) as string[];
+    setChats((current) => current.map((chat) => profilePicCache.current[chat.chatId]
+      ? { ...chat, profilePicUrl: profilePicCache.current[chat.chatId]! } : chat));
     const loadProfiles = async () => {
       while (!cancelled) {
-        const chat = profileQueue.shift();
-        if (!chat) return;
-        if (Object.prototype.hasOwnProperty.call(profilePicCache.current, chat.chatId) || profilePicRequests.current.has(chat.chatId)) continue;
-        profilePicRequests.current.add(chat.chatId);
+        const chatId = profileQueue.shift();
+        if (!chatId) return;
+        if (Object.prototype.hasOwnProperty.call(profilePicCache.current, chatId)) continue;
         try {
-          const profileResponse = await bridgeFetch(`${normalizedBridgeUrl}/chats/${encodeURIComponent(chat.chatId)}/profile`);
+          const profileResponse = await bridgeFetch(`${normalizedBridgeUrl}/chats/${encodeURIComponent(chatId)}/profile`, { signal: controller.signal });
           if (!profileResponse.ok) {
             continue;
           }
           const profile = await profileResponse.json() as { profilePicUrl?: string | null };
-          profilePicCache.current[chat.chatId] = profile.profilePicUrl || null;
+          profilePicCache.current[chatId] = profile.profilePicUrl || null;
           if (cancelled || !profile.profilePicUrl) continue;
-          setChats((current) => current.map((item) => item.chatId === chat.chatId ? { ...item, profilePicUrl: profile.profilePicUrl || undefined } : item));
+          setChats((current) => current.map((item) => item.chatId === chatId ? { ...item, profilePicUrl: profile.profilePicUrl || undefined } : item));
         } catch {
           // Profile pictures are optional and must not affect synchronization.
-        } finally {
-          profilePicRequests.current.delete(chat.chatId);
         }
       }
     };
     void Promise.all(Array.from({ length: 4 }, () => loadProfiles()));
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [enabled, normalizedBridgeUrl, visibleChats]);
+  }, [enabled, status, normalizedBridgeUrl, profileChatIds, selectedChatId, showSettings, showDiagnostics]);
 
   useEffect(() => {
-    let socket: WebSocket | undefined;
-    let reconnectTimer: number | undefined;
     let cancelled = false;
+    let chatsLoading = false;
+    let healthLoading = false;
+    const controller = new AbortController();
 
     if (!enabled) {
       updateStatus("disabled");
@@ -500,8 +507,11 @@ function WhatsAppPanel() {
     }
 
     const loadChats = async () => {
+      if (cancelled || chatsLoading) return;
+      chatsLoading = true;
       try {
-        const response = await bridgeFetch(`${normalizedBridgeUrl}/chats`);
+        const response = await bridgeFetch(`${normalizedBridgeUrl}/chats`, { signal: controller.signal });
+        if (!response.ok) throw new Error(`contacts request failed (${response.status})`);
         const result = await response.json() as { chats: ChatSummary[]; hasMore?: boolean };
         console.log("[decky-whatsapp] contacts response", { count: result.chats?.length ?? 0 });
         if (!cancelled) {
@@ -511,21 +521,25 @@ function WhatsAppPanel() {
           })));
         }
       } catch (loadError) {
+        if (cancelled) return;
         console.error("[decky-whatsapp] contacts request failed", loadError);
         // The health request reports the connection error to the user.
+      } finally {
+        chatsLoading = false;
       }
     };
 
     const refreshBridgeStatus = async () => {
+      if (cancelled || healthLoading) return;
+      healthLoading = true;
       try {
-        const response = await bridgeFetch(`${normalizedBridgeUrl}/health`);
+        const response = await bridgeFetch(`${normalizedBridgeUrl}/health`, { signal: controller.signal });
         if (!response.ok) throw new Error(`health check failed (${response.status})`);
         const health = await response.json() as { status: BridgeStatus };
         if (!cancelled) {
           bridgeHealthFailures.current = 0;
           updateStatus(health.status);
           setLastHealthCheckAt(Date.now());
-          setError("");
         }
       } catch {
         if (!cancelled) {
@@ -535,6 +549,8 @@ function WhatsAppPanel() {
             reportError("Bridge unavailable; retrying connection…");
           }
         }
+      } finally {
+        healthLoading = false;
       }
     };
 
@@ -553,6 +569,7 @@ function WhatsAppPanel() {
         return [updated, ...current.filter((chat) => chat.chatId !== incoming.chatId)];
       });
       if (incoming.chatId === selectedChatIdRef.current) {
+        historyRevision.current += 1;
         setHistory((current) => current.some((message) => message.id === incoming.id) ? current : [...current, incoming]);
       }
     };
@@ -563,38 +580,36 @@ function WhatsAppPanel() {
         : chat));
     };
 
-    const scheduleReconnect = () => {
-      if (cancelled || reconnectTimer !== undefined) return;
-      reconnectTimer = window.setTimeout(() => {
-        reconnectTimer = undefined;
-        void connect();
-      }, 2000);
-    };
-
-    const connect = async () => {
-      if (!cancelled) setSocketState("connecting");
-      try {
-        const response = await bridgeFetch(`${normalizedBridgeUrl}/health`);
-        const health = await response.json() as { status: BridgeStatus };
-        if (!cancelled) {
-          updateStatus(health.status);
-          setLastHealthCheckAt(Date.now());
-        }
-        await loadChats();
-        socket = new WebSocket(await bridgeWebSocketUrl(normalizedBridgeUrl));
-        socket.onopen = () => {
-          if (!cancelled) setSocketState("connected");
-        };
-        socket.onmessage = (event) => {
-          const message = JSON.parse(event.data) as BridgeEvent;
-          if (message.type === "status") updateStatus(message.status);
+    let lastStatus: BridgeStatus = "unknown";
+    setSocketState("connecting");
+    const connection = connectSocket({
+      url: () => bridgeWebSocketUrl(normalizedBridgeUrl),
+      onOpen: () => {
+        setSocketState("connected");
+        bridgeHealthFailures.current = 0;
+        setError("");
+        void refreshBridgeStatus();
+      },
+      onMessage: (data) => {
+          const message = JSON.parse(data) as BridgeEvent;
+          if (message.type === "status") {
+            updateStatus(message.status);
+            if (message.status === "ready" && lastStatus !== "ready") {
+              void loadChats();
+              if (selectedChatIdRef.current) setHistoryRefresh((current) => current + 1);
+            }
+            lastStatus = message.status;
+          }
           if (message.type === "message") {
             addMessage(message.message);
             if (message.message.chatId === selectedChatIdRef.current && message.message.mediaKind) setHistoryRefresh((current) => current + 1);
           }
           if (message.type === "message_update") {
             updateChatPreview(message.message);
-            setHistory((current) => current.map((existing) => existing.id === message.message.id ? { ...existing, ...message.message } : existing));
+            if (message.message.chatId === selectedChatIdRef.current) historyRevision.current += 1;
+            setHistory((current) => current.map((existing) => existing.id !== message.message.id ? existing
+              : message.update === "deleted" ? { ...existing, ...message.message, reaction: undefined, reactions: undefined }
+              : { ...existing, body: message.message.body }));
           }
           if (message.type === "message_ack") {
             setHistory((current) => current.map((existing) => existing.id === message.messageId ? { ...existing, ack: message.ack } : existing));
@@ -609,88 +624,66 @@ function WhatsAppPanel() {
             }));
             if (message.fromMe) setOwnReactions((current) => ({ ...current, [message.messageId]: message.emoji || null }));
           }
-        };
-        socket.onerror = () => {
+      },
+      onError: () => {
           setSocketState("disconnected");
-          reportError("Unable to connect to the bridge");
-        };
-        socket.onclose = () => {
-          if (!cancelled) {
+          reportError("Unable to connect to the bridge; retrying…");
+      },
+      onClose: () => {
             setSocketState("disconnected");
             resetBridgeToken();
+            lastStatus = "unknown";
             reportError("Bridge connection lost; retrying…");
-            scheduleReconnect();
-          }
-        };
-      } catch {
-        if (!cancelled) {
-          setSocketState("disconnected");
-          bridgeHealthFailures.current += 1;
-          if (bridgeHealthFailures.current >= 3) {
-            updateStatus("unknown");
-            reportError("Bridge unavailable; retrying connection…");
-          }
-        }
-        scheduleReconnect();
       }
-    };
+    });
 
-    void connect();
     const polling = window.setInterval(() => {
       void refreshBridgeStatus();
       // WebSocket events are the primary synchronization path. Only refresh
       // the full chat list when the socket is not currently connected.
-      if (!socket || socket.readyState !== WebSocket.OPEN) void loadChats();
+      if (!connection.connected) void loadChats();
     }, 60000);
     return () => {
       cancelled = true;
       window.clearInterval(polling);
-      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
-      socket?.close();
+      controller.abort();
+      connection.close();
     };
   }, [enabled, normalizedBridgeUrl, connectionRefresh]);
 
   useEffect(() => {
-    if (!selectedChatId || historyRefresh === 0) return;
-    let cancelled = false;
-    const refreshActiveHistory = async () => {
-      try {
-        const limit = compactHistory && !historyExpanded ? 5 : 50;
-        const response = await bridgeFetch(`${normalizedBridgeUrl}/chats/${encodeURIComponent(selectedChatId)}/messages?limit=${limit}`);
-        if (!response.ok) return;
-        const result = await response.json() as { messages: IncomingMessage[] };
-        if (!cancelled) setHistory(mergeOwnReactions(result.messages));
-      } catch {
-        // The normal connection recovery path will retry the next update.
-      }
-    };
-    void refreshActiveHistory();
-    return () => {
-      cancelled = true;
-    };
-  }, [historyRefresh, selectedChatId, normalizedBridgeUrl, compactHistory, historyExpanded]);
+    if (!selectedChatId || !enabled || historyRefresh === 0) return;
+    // Coalesce bursts of media/status events into one history request.
+    const timer = window.setTimeout(() => {
+      void loadHistory(selectedChatId).catch(() => undefined);
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [historyRefresh]);
 
   useEffect(() => {
-    if (!selectedChatId || historyLoading) return;
+    if (!selectedChatId || historyLoading || !scrollOnOpen.current) return;
     let cancelled = false;
+    let timer: number | undefined;
     const scrollToBottom = () => {
-      if (cancelled || !conversationEndRef.current) return;
+      if (cancelled || !conversationEndRef.current || isTextEntryFocused() || replyInputActive.current) return;
       conversationEndRef.current.focus({ preventScroll: true });
       conversationEndRef.current.scrollIntoView({ behavior: "auto", block: "end" });
     };
     const frame = window.requestAnimationFrame(() => {
+      scrollOnOpen.current = false;
       scrollToBottom();
-      window.setTimeout(scrollToBottom, 150);
+      timer = window.setTimeout(scrollToBottom, 150);
     });
     return () => {
       cancelled = true;
       window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
     };
   }, [selectedChatId, historyLoading, history.length]);
 
   useEffect(() => {
     const handleVoicePlaybackKey = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() !== "y") return;
+      if (event.defaultPrevented || isTextEntryFocused() || replyInputActive.current || event.key.toLowerCase() !== "y") return;
       const focusedMessage = history.find((message) => message.id === focusedMessageId) || history.find((message) => message.id === selectedMessageId);
       if (!focusedMessage || focusedMessage.media?.kind !== "audio") return;
       const audio = audioRefs.current[focusedMessage.id];
@@ -708,6 +701,7 @@ function WhatsAppPanel() {
     if (!input?.RegisterForControllerInputMessages) return;
     // Decky's controller button values: A=0, B=1, X=2, Y=3, D-pad left=7.
     const registration = input.RegisterForControllerInputMessages((_controllerIndex, gamepadButton, isButtonPressed) => {
+      if (isTextEntryFocused() || replyInputActive.current) return;
       if (isButtonPressed && gamepadButton === 2) {
         if (isTextEntryFocused() || replyInputActive.current) return;
         const focusedMessage = history.find((message) => message.id === focusedMessageId) || history.find((message) => message.id === selectedMessageId);
@@ -757,18 +751,15 @@ function WhatsAppPanel() {
   };
 
   const shutdownAll = async () => {
+    if (shuttingDown) return;
+    window.localStorage.setItem("decky-whatsapp-enabled", "false");
+    setEnabled(false);
     stopBackgroundNotifications();
-    if (voiceSession.current) {
-      voiceSession.current.processor.disconnect();
-      voiceSession.current.source.disconnect();
-      voiceSession.current.stream.getTracks().forEach((track) => track.stop());
-      void voiceSession.current.context.close();
-      voiceSession.current = undefined;
-      setVoiceState("idle");
-    }
+    closeConversation();
     setShuttingDown(true);
     try {
-      await bridgeFetch(`${normalizedBridgeUrl}/shutdown`, { method: "POST" });
+      const response = await bridgeFetch(`${normalizedBridgeUrl}/shutdown`, { method: "POST" });
+      if (!response.ok) throw new Error(`shutdown failed (${response.status})`);
       toaster.toast({ title: "Decky WhatsApp", body: "Bridge and SSH tunnel shutting down", duration: 4000 });
     } catch {
       toaster.toast({ title: "Decky WhatsApp", body: "Could not reach the PC bridge", duration: 5000 });
@@ -781,17 +772,42 @@ function WhatsAppPanel() {
   };
 
   const loadHistory = async (chatId: string, limit = compactHistory && !historyExpanded ? 5 : 50) => {
-    const response = await bridgeFetch(`${normalizedBridgeUrl}/chats/${encodeURIComponent(chatId)}/messages?limit=${limit}`);
-    if (!response.ok) {
-      const details = await response.json().catch(() => undefined) as { error?: string } | undefined;
-      throw new Error(`History request failed (${response.status}): ${details?.error || "unknown bridge error"}`);
+    if (!panelMounted.current || selectedChatIdRef.current !== chatId) return;
+    historyRequest.current?.abort();
+    const controller = new AbortController();
+    historyRequest.current = controller;
+    const revision = historyRevision.current;
+    try {
+      const response = await bridgeFetch(`${normalizedBridgeUrl}/chats/${encodeURIComponent(chatId)}/messages?limit=${limit}`, { signal: controller.signal });
+      if (!response.ok) {
+        const details = await response.json().catch(() => undefined) as { error?: string } | undefined;
+        throw new Error(`History request failed (${response.status}): ${details?.error || "unknown bridge error"}`);
+      }
+      const result = await response.json() as { messages: IncomingMessage[]; hasMore?: boolean };
+      if (controller.signal.aborted || !panelMounted.current || selectedChatIdRef.current !== chatId) return;
+      if (historyRevision.current !== revision) {
+        setHistoryRefresh((current) => current + 1);
+        return;
+      }
+      const messages = result.messages.map((message) => ({ ...message, reactions: uniqueReactions(message.reactions) }));
+      setOwnReactions((current) => {
+        const updated = { ...current };
+        for (const message of messages) updated[message.id] = message.reaction || null;
+        return updated;
+      });
+      setHistory((current) => [...messages, ...current.filter((message) => message.chatId === chatId && message.id.startsWith("local-failed-"))]);
+      setHistoryHasMore(Boolean(result.hasMore));
+    } catch (historyError) {
+      if (!controller.signal.aborted) throw historyError;
     }
-    const result = await response.json() as { messages: IncomingMessage[]; hasMore?: boolean };
-    setHistory(mergeOwnReactions(result.messages));
-    setHistoryHasMore(Boolean(result.hasMore));
   };
 
   const selectChat = async (chat: ChatSummary) => {
+    const run = ++conversationRun.current;
+    scrollOnOpen.current = true;
+    selectedChatIdRef.current = chat.chatId;
+    setSelectedMessageId("");
+    setReplyTarget(undefined);
     setSelectedChat(chat);
     setSelectedChatId(chat.chatId);
     setHistory([]);
@@ -802,97 +818,135 @@ function WhatsAppPanel() {
     setError("");
     try {
       await loadHistory(chat.chatId, compactHistory ? 5 : 50);
+      if (conversationRun.current !== run || selectedChatIdRef.current !== chat.chatId || !panelMounted.current) return;
+      // Only mark the conversation read after it is open and its history request
+      // completed. Retry transient failures without delaying conversation display.
+      void bridgeFetch(`${normalizedBridgeUrl}/chats/${encodeURIComponent(chat.chatId)}/read`, { method: "POST" })
+        .then(async (response) => {
+          if (!response.ok) throw new Error(`mark-read request failed (${response.status})`);
+          const result = await response.json() as { marked?: boolean };
+          if (!result.marked) throw new Error("WhatsApp did not confirm the conversation was read");
+          if (selectedChatIdRef.current === chat.chatId && panelMounted.current) {
+            setChats((current) => current.map((item) => item.chatId === chat.chatId ? { ...item, unreadCount: 0 } : item));
+          }
+        })
+        .catch((error) => console.warn("[decky-whatsapp] could not mark conversation as read", { chatId: chat.chatId, error }));
     } catch (selectionError) {
-      reportError(selectionError instanceof Error ? selectionError.message : "Unable to load conversation history");
+      if (conversationRun.current === run && panelMounted.current) reportError(selectionError instanceof Error ? selectionError.message : "Unable to load conversation history");
     } finally {
-      setHistoryLoading(false);
+      if (conversationRun.current === run && panelMounted.current) setHistoryLoading(false);
     }
   };
 
   const loadMoreHistory = async () => {
     if (!selectedChatId || historyExpanded) return;
+    const run = conversationRun.current;
     setHistoryExpanded(true);
     setHistoryLoading(true);
     try {
       await loadHistory(selectedChatId, 50);
     } catch {
+      if (conversationRun.current !== run || !panelMounted.current) return;
       reportError("Older messages could not be loaded");
       setHistoryExpanded(false);
     } finally {
-      setHistoryLoading(false);
+      if (conversationRun.current === run && panelMounted.current) setHistoryLoading(false);
     }
   };
 
   const sendReply = async () => {
-    if (!selectedChatId || !reply.trim()) return;
+    if (!selectedChatId || !reply.trim() || sendInFlight.current) return;
+    sendInFlight.current = true;
+    setSending(true);
+    const chatId = selectedChatId;
+    const run = conversationRun.current;
+    const stillActive = () => panelMounted.current && conversationRun.current === run;
     const body = reply.trim();
+    const draft = reply;
     const chatName = selectedChat?.chatName || "Conversation";
     setError("");
     console.log("[decky-whatsapp] sending reply", { chatId: selectedChatId, quotedMessageId: replyTarget?.id, bodyLength: body.length });
     try {
-      const response = await bridgeFetch(`${normalizedBridgeUrl}/messages`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId: selectedChatId, body, quotedMessageId: replyTarget?.id })
-      });
-      if (!response.ok) {
-        const details = await response.json().catch(() => undefined) as { error?: string } | undefined;
-        throw new Error(details?.error || `send failed (${response.status})`);
+      try {
+        const response = await bridgeFetch(`${normalizedBridgeUrl}/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chatId, body, quotedMessageId: replyTarget?.id })
+        });
+        if (!response.ok) {
+          const details = await response.json().catch(() => undefined) as { error?: string } | undefined;
+          throw new Error(details?.error || `send failed (${response.status})`);
+        }
+      } catch (sendError) {
+        const message = sendError instanceof Error && sendError.name === "AbortError"
+          ? "No send confirmation received. Check WhatsApp before retrying."
+          : sendError instanceof Error ? sendError.message : "Message could not be sent";
+        console.error("[decky-whatsapp] send failed", sendError);
+        if (!stillActive()) return;
+        reportError(message);
+        setHistory((current) => [...current, {
+          id: `local-failed-${Date.now()}`,
+          chatId,
+          chatName,
+          sender: "You",
+          body,
+          timestamp: Math.floor(Date.now() / 1000),
+          fromMe: true,
+          quotedMessageId: replyTarget?.id,
+          ack: -1
+        }]);
+        return;
       }
-    } catch (sendError) {
-      const message = sendError instanceof Error ? sendError.message : "Message could not be sent";
-      console.error("[decky-whatsapp] send failed", sendError);
-      reportError(message);
-      setHistory((current) => [...current, {
-        id: `local-failed-${Date.now()}`,
-        chatId: selectedChatId,
-        chatName,
-        sender: "You",
-        body,
-        timestamp: Math.floor(Date.now() / 1000),
-        fromMe: true,
-        ack: -1
-      }]);
-      return;
-    }
 
-    setReply("");
-    setReplyTarget(undefined);
-    setHistoryLoading(true);
-    try {
-      await loadHistory(selectedChatId, compactHistory && !historyExpanded ? 5 : 50);
-    } catch {
-      reportError("Message was sent, but the conversation could not be refreshed");
+      if (!stillActive()) return;
+      setReply((current) => current === draft ? "" : current);
+      setReplyTarget((current) => current?.id === replyTarget?.id ? undefined : current);
+      setSelectedMessageId((current) => current === selectedMessageId ? "" : current);
+      setHistoryLoading(true);
+      try {
+        await loadHistory(chatId, compactHistory && !historyExpanded ? 5 : 50);
+      } catch {
+        if (stillActive()) reportError("Message was sent, but the conversation could not be refreshed");
+      } finally {
+        if (stillActive()) setHistoryLoading(false);
+      }
     } finally {
-      setHistoryLoading(false);
+      sendInFlight.current = false;
+      if (panelMounted.current) setSending(false);
     }
   };
 
   const retryMessage = async (message: IncomingMessage) => {
-    if (!selectedChatId || !message.fromMe || message.ack !== -1 || messageActionId) return;
+    if (!selectedChatId || !message.fromMe || message.ack !== -1 || actionInFlight.current) return;
+    actionInFlight.current = true;
+    const run = conversationRun.current;
     setMessageActionId(message.id);
     setError("");
     try {
       const response = await bridgeFetch(`${normalizedBridgeUrl}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chatId: message.chatId, body: message.body })
+        body: JSON.stringify({ chatId: message.chatId, body: message.body, quotedMessageId: message.quotedMessageId })
       });
       if (!response.ok) {
         const details = await response.json().catch(() => undefined) as { error?: string } | undefined;
         throw new Error(details?.error || `retry failed (${response.status})`);
       }
+      if (!panelMounted.current || conversationRun.current !== run) return;
       setHistory((current) => current.filter((currentMessage) => currentMessage.id !== message.id));
       await loadHistory(selectedChatId, compactHistory && !historyExpanded ? 5 : 50);
     } catch (retryError) {
-      reportError(retryError instanceof Error ? retryError.message : "Message could not be retried");
+      if (panelMounted.current && conversationRun.current === run) reportError(retryError instanceof Error ? retryError.message : "Message could not be retried");
     } finally {
-      setMessageActionId("");
+      actionInFlight.current = false;
+      if (panelMounted.current) setMessageActionId("");
     }
   };
 
   const deleteMessage = async (message: IncomingMessage) => {
-    if (!selectedChatId || !message.fromMe || messageActionId) return;
+    if (!selectedChatId || !message.fromMe || actionInFlight.current) return;
+    actionInFlight.current = true;
+    const run = conversationRun.current;
     setMessageActionId(message.id);
     setError("");
     try {
@@ -905,14 +959,18 @@ function WhatsAppPanel() {
         const details = await response.json().catch(() => undefined) as { error?: string } | undefined;
         throw new Error(details?.error || `delete failed (${response.status})`);
       }
+      if (!panelMounted.current || conversationRun.current !== run) return;
       setHistory((current) => current.map((currentMessage) => currentMessage.id === message.id
         ? { ...currentMessage, body: "[Message deleted]", mediaKind: undefined, image: undefined, media: undefined, reaction: undefined, reactions: undefined }
         : currentMessage));
+      setReplyTarget((current) => current?.id === message.id ? undefined : current);
+      setSelectedMessageId((current) => current === message.id ? "" : current);
       toaster.toast({ title: "WhatsApp", body: "Message deleted", duration: 2500 });
     } catch (deleteError) {
-      reportError(deleteError instanceof Error ? deleteError.message : "Message could not be deleted");
+      if (panelMounted.current && conversationRun.current === run) reportError(deleteError instanceof Error ? deleteError.message : "Message could not be deleted");
     } finally {
-      setMessageActionId("");
+      actionInFlight.current = false;
+      if (panelMounted.current) setMessageActionId("");
     }
   };
 
@@ -943,6 +1001,11 @@ function WhatsAppPanel() {
   };
 
   const closeConversation = () => {
+    conversationRun.current += 1;
+    selectedChatIdRef.current = "";
+    historyRequest.current?.abort();
+    stopRecording();
+    setVoiceState("idle");
     setSelectedChat(undefined);
     setSelectedChatId("");
     setHistory([]);
@@ -956,25 +1019,23 @@ function WhatsAppPanel() {
   };
 
   const startVoiceTyping = async () => {
-    if (voiceState === "transcribing") return;
+    if (voiceState === "transcribing" || voiceStarting.current) return;
+    const run = conversationRun.current;
+    const stillActive = () => panelMounted.current && conversationRun.current === run;
     if (voiceTypingAvailable === false) {
       toaster.toast({ title: "Voice typing unavailable", body: voiceTypingReason || "Install the optional Deck-local Whisper engine first", duration: 6000 });
       return;
     }
     if (voiceState === "recording") {
-      const session = voiceSession.current;
+      const session = stopRecording();
       if (!session) return;
-      session.processor.disconnect();
-      session.source.disconnect();
-      session.stream.getTracks().forEach((track) => track.stop());
-      await session.context.close();
-      voiceSession.current = undefined;
       setVoiceState("transcribing");
       setError("Transcribing…");
       try {
         const wav = encodeWav(session.chunks, session.sampleRate);
         if (session.chunks.length === 0) throw new Error("No audio was captured from the microphone");
         const transcript = await call<[string], string>("transcribe_audio", arrayBufferToBase64(wav));
+        if (!stillActive()) return;
         if (transcript.startsWith("__VOICE_ERROR__")) {
           const details = transcript.slice("__VOICE_ERROR__".length);
           if (/marker|not installed|executable|model is missing|path is empty/i.test(details)) {
@@ -985,21 +1046,28 @@ function WhatsAppPanel() {
         }
         if (!transcript?.trim()) throw new Error("Whisper returned no text");
         setReply((current) => current ? `${current} ${transcript.trim()}` : transcript.trim());
+        setError("");
         toaster.toast({ title: "Voice typing", body: "Text added to your reply", duration: 3000 });
       } catch (voiceError) {
+        if (!stillActive()) return;
         const message = errorMessage(voiceError);
         reportError(message);
         toaster.toast({ title: "Voice typing failed", body: message, duration: 6000 });
       } finally {
-        setVoiceState("idle");
+        if (stillActive()) setVoiceState("idle");
       }
       return;
     }
 
+    voiceStarting.current = true;
+    let stream: MediaStream | undefined;
+    let context: AudioContext | undefined;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const context = new AudioContext();
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!stillActive()) { stream.getTracks().forEach((track) => track.stop()); return; }
+      context = new AudioContext();
       await context.resume();
+      if (!stillActive()) { stream.getTracks().forEach((track) => track.stop()); await context.close(); return; }
       const source = context.createMediaStreamSource(stream);
       const processor = context.createScriptProcessor(4096, 1, 1);
       const silentOutput = context.createGain();
@@ -1015,7 +1083,11 @@ function WhatsAppPanel() {
       setVoiceState("recording");
       toaster.toast({ title: "Voice typing", body: "Recording… press the microphone again to stop", duration: 3000 });
     } catch (voiceError) {
-      reportError(voiceError instanceof Error ? voiceError.message : "Microphone access failed");
+      stream?.getTracks().forEach((track) => track.stop());
+      void context?.close().catch(() => undefined);
+      if (stillActive()) reportError(voiceError instanceof Error ? voiceError.message : "Microphone access failed");
+    } finally {
+      voiceStarting.current = false;
     }
   };
 
@@ -1048,6 +1120,7 @@ function WhatsAppPanel() {
   };
 
   const displayedHistory = compactHistory && !historyExpanded ? history.slice(-5) : history;
+  const selectedMessage = replyTarget ? history.find((message) => message.id === selectedMessageId) : undefined;
 
   return (
     <>
@@ -1122,7 +1195,7 @@ function WhatsAppPanel() {
           <PanelSectionRow><ButtonItem layout="below" onClick={closeConversation}><span style={{ display: "flex", alignItems: "center", gap: "10px" }}><FaArrowLeft /> Back to contacts</span></ButtonItem></PanelSectionRow>
           {historyLoading && <PanelSectionRow><div style={{ opacity: 0.7 }}>Loading conversation...</div></PanelSectionRow>}
           {!historyLoading && history.length === 0 && <PanelSectionRow><div style={{ opacity: 0.7 }}>No message history</div></PanelSectionRow>}
-          {!historyLoading && compactHistory && !historyExpanded && historyHasMore && <PanelSectionRow><ButtonItem layout="below" onClick={() => void loadMoreHistory()}><span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>Load more messages</span></ButtonItem></PanelSectionRow>}
+          {!historyLoading && compactHistory && !historyExpanded && (historyHasMore || history.length > 5) && <PanelSectionRow><ButtonItem layout="below" onClick={() => void loadMoreHistory()}><span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>Load more messages</span></ButtonItem></PanelSectionRow>}
           {displayedHistory.map((message) => (
             <Fragment key={message.id}>
             <PanelSectionRow>
@@ -1146,18 +1219,14 @@ function WhatsAppPanel() {
                 </ButtonItem>
               </div>
             </PanelSectionRow>
-            {selectedMessageId === message.id && message.fromMe && <PanelSectionRow><div style={{ display: "flex", gap: "8px", width: "100%" }}>
-              {message.ack === -1 && <ButtonItem layout="below" disabled={messageActionId === message.id} onClick={() => void retryMessage(message)}>Retry message</ButtonItem>}
-              {!message.id.startsWith("local-failed-") && !message.body.startsWith("[Message deleted]") && <ButtonItem layout="below" disabled={messageActionId === message.id} onClick={() => void deleteMessage(message)}>Delete for everyone</ButtonItem>}
-            </div></PanelSectionRow>}
             </Fragment>
           ))}
           <div ref={conversationEndRef} tabIndex={-1} aria-hidden="true" style={{ height: "1px", outline: "none" }} />
           <PanelSectionRow>
-            {replyTarget && <div style={{ marginBottom: "8px", padding: "8px 10px", borderLeft: "3px solid #63d2ad", background: "rgba(255,255,255,0.08)", borderRadius: "4px" }}><div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", opacity: 0.8 }}><FaReply /> Replying to {replyTarget.sender}</div><div style={{ opacity: 0.65, fontSize: "12px", marginTop: "3px" }}>{replyTarget.body.slice(0, 120)}</div><ButtonItem layout="below" onClick={() => setReplyTarget(undefined)}>Cancel reply</ButtonItem></div>}
+            {replyTarget && <div style={{ marginBottom: "8px", padding: "8px 10px", borderLeft: "3px solid #63d2ad", background: "rgba(255,255,255,0.08)", borderRadius: "4px" }}><div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", opacity: 0.8 }}><FaReply /> Replying to {replyTarget.sender}</div><div style={{ opacity: 0.65, fontSize: "12px", marginTop: "3px" }}>{replyTarget.body.slice(0, 120)}</div><ButtonItem layout="below" onClick={() => { setReplyTarget(undefined); setSelectedMessageId(""); }}>Cancel reply</ButtonItem>{selectedMessage?.fromMe && <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "8px" }}>{selectedMessage.ack === -1 && <ButtonItem layout="below" disabled={messageActionId === selectedMessage.id} onClick={() => void retryMessage(selectedMessage)}>Retry message</ButtonItem>}{!selectedMessage.id.startsWith("local-failed-") && !selectedMessage.body.startsWith("[Message deleted]") && <ButtonItem layout="below" disabled={messageActionId === selectedMessage.id} onClick={() => void deleteMessage(selectedMessage)}>Delete for everyone</ButtonItem>}</div>}</div>}
             <TextField key={replyTarget?.id || "new-reply"} label="Reply" value={reply} focusOnMount={Boolean(replyTarget)} onFocus={() => { replyInputActive.current = true; }} onBlur={() => { replyInputActive.current = false; }} onChange={(value) => setReply(inputValue(value))} />
           </PanelSectionRow>
-          <PanelSectionRow><div style={{ display: "flex", flexDirection: "column", gap: "8px", width: "100%" }}><ButtonItem layout="below" onClick={() => void sendReply()}><span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}><FaPaperPlane /> Send reply</span></ButtonItem><ButtonItem layout="below" disabled={voiceTypingAvailable === false} onClick={startVoiceTyping}><span style={{ display: "flex", width: "100%", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "4px", fontSize: "24px", opacity: voiceTypingAvailable === false ? 0.5 : 1 }}>{voiceState === "recording" ? <FaStop aria-label="Stop recording" /> : <FaMicrophone aria-label="Voice typing" />}<span style={{ fontSize: "11px" }}>{voiceState === "recording" ? "Stop recording" : voiceTypingAvailable === false ? "Whisper not installed" : voiceState === "transcribing" ? "Transcribing…" : "Voice typing"}</span></span></ButtonItem></div></PanelSectionRow>
+          <PanelSectionRow><div style={{ display: "flex", flexDirection: "column", gap: "8px", width: "100%" }}><ButtonItem layout="below" disabled={sending || !reply.trim()} onClick={() => void sendReply()}><span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}><FaPaperPlane /> Send reply</span></ButtonItem><ButtonItem layout="below" disabled={voiceTypingAvailable === false} onClick={startVoiceTyping}><span style={{ display: "flex", width: "100%", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "4px", fontSize: "24px", opacity: voiceTypingAvailable === false ? 0.5 : 1 }}>{voiceState === "recording" ? <FaStop aria-label="Stop recording" /> : <FaMicrophone aria-label="Voice typing" />}<span style={{ fontSize: "11px" }}>{voiceState === "recording" ? "Stop recording" : voiceTypingAvailable === false ? "Whisper not installed" : voiceState === "transcribing" ? "Transcribing…" : "Voice typing"}</span></span></ButtonItem></div></PanelSectionRow>
         </PanelSection>
       )}
     </>
@@ -1169,11 +1238,5 @@ export default definePlugin(() => ({
   title: <div>WhatsApp</div>,
   content: <WhatsAppPanel />,
   icon: <FaWhatsapp />,
-  onDismount: () => {
-    const keepNotifications =
-      window.localStorage.getItem("decky-whatsapp-enabled") === "true" &&
-      window.localStorage.getItem("decky-whatsapp-notifications-enabled") !== "false" &&
-      window.localStorage.getItem("decky-whatsapp-notifications-while-gaming") !== "false";
-    if (!keepNotifications) stopBackgroundNotifications();
-  }
+  onDismount: stopBackgroundNotifications
 }));

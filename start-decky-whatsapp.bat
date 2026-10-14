@@ -41,7 +41,12 @@ if defined DECK_PORT_BUSY (
 )
 
 echo Starting the WhatsApp bridge...
-powershell.exe -NoProfile -Command "$connection = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort %BRIDGE_PORT% -State Listen -ErrorAction SilentlyContinue; if ($connection) { Write-Host ('Closing previous local bridge (PID ' + $connection[0].OwningProcess + ')...'); Stop-Process -Id $connection[0].OwningProcess -Force -ErrorAction SilentlyContinue }"
+powershell.exe -NoProfile -Command "$ErrorActionPreference = 'Stop'; $connection = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort %BRIDGE_PORT% -State Listen -ErrorAction SilentlyContinue; if (-not $connection) { exit 0 }; try { $bridgePid = $connection[0].OwningProcess; $url = 'http://127.0.0.1:%BRIDGE_PORT%'; $bootstrap = Invoke-RestMethod ($url + '/bootstrap') -Headers @{ Origin = 'https://steamloopback.host' } -TimeoutSec 5; if ($bootstrap.token -notmatch '^[a-f0-9]{64}$') { throw 'The port is occupied by an unrecognized service.' }; $headers = @{ Authorization = ('Bearer ' + $bootstrap.token) }; $health = Invoke-RestMethod ($url + '/health') -Headers $headers -TimeoutSec 5; if ($health.ok -ne $true -or -not $health.status) { throw 'The port is occupied by an unrecognized service.' }; Write-Host 'Stopping the previous bridge cleanly...'; Invoke-RestMethod ($url + '/shutdown') -Method Post -Headers $headers -TimeoutSec 5 | Out-Null; for ($attempt = 0; $attempt -lt 24; $attempt++) { if (-not (Get-Process -Id $bridgePid -ErrorAction SilentlyContinue)) { exit 0 }; Start-Sleep -Milliseconds 500 }; throw 'The previous bridge has not stopped yet. Close its window and try again.' } catch { Write-Host $_.Exception.Message; exit 1 }"
+if errorlevel 1 (
+    echo Could not safely restart the PC bridge. Close the existing bridge window, then try again.
+    pause
+    exit /b 1
+)
 start "Decky WhatsApp bridge" /D "%PROJECT_DIR%" cmd /c "npm.cmd start"
 
 echo Waiting for the bridge to start...

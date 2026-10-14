@@ -1,7 +1,7 @@
 {
   "name": "Decky WhatsApp",
   "author": "DeckyWhatsapp",
-  "flags": ["root"],
+  "flags": [],
   "publish": {
     "tags": ["messaging"],
     "description": "Read and reply to WhatsApp messages from Gaming Mode through a PC bridge."

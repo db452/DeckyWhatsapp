@@ -61,6 +61,7 @@ function formatMessageBody(
 
   const mediaKind = media?.kind || getMediaKind(message);
   if (mediaKind) {
+    if (typeof message.body === "string" && message.body.trim()) return message.body;
     return `[${mediaKind === "sticker" ? "Sticker" : mediaKind === "gif" ? "GIF" : mediaKind === "audio" ? "Voice message" : "Image"}]`;
   }
 
@@ -107,6 +108,9 @@ export class WhatsAppService {
   private readonly reactionCache = new Map<string, string>();
   private readonly contactNameCache = new Map<string, string>();
   private readonly profilePicCache = new Map<string, string | null>();
+  private readonly mediaCache = new Map<string, NonNullable<IncomingMessage["media"]>>();
+  private readonly mediaRequests = new Map<string, Promise<IncomingMessage["media"]>>();
+  private mediaCacheBytes = 0;
   private readonly listeners = new Set<(event: BridgeEvent) => void>();
   private reconnectTimer: NodeJS.Timeout | undefined;
   private reconnectAttempt = 0;
@@ -259,6 +263,7 @@ export class WhatsAppService {
 
   private async publishMessageUpdate(message: RuntimeMessage, update: "edited" | "deleted", body?: string): Promise<void> {
     try {
+      if (update === "deleted") this.forgetMedia(getMessageId(message, ""));
       let chatId = message.from;
       let chatName = message.from;
       try {
@@ -333,6 +338,26 @@ export class WhatsAppService {
     }
   }
 
+  async markChatRead(chatId: string): Promise<boolean> {
+    if (this.status !== "ready") throw new Error("WhatsApp is not ready");
+
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const marked = await this.client.sendSeen(chatId);
+        console.log(`[read] ${chatId}: ${marked ? "marked read" : "WhatsApp did not confirm"} (attempt ${attempt})`);
+        if (marked) return true;
+        if (attempt === 1) await new Promise((resolve) => setTimeout(resolve, 500));
+      } catch (error) {
+        lastError = error;
+        console.warn(`[read] failed to mark ${chatId} as read (attempt ${attempt})`, error);
+        if (attempt === 1) await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+    if (lastError) throw lastError;
+    return false;
+  }
+
   async getProfilePicUrl(chatId: string): Promise<string | undefined> {
     if (this.status !== "ready") throw new Error("WhatsApp is not ready");
     if (this.profilePicCache.has(chatId)) return this.profilePicCache.get(chatId) || undefined;
@@ -362,7 +387,7 @@ export class WhatsAppService {
     }
   }
 
-  async getChatHistory(chatId: string, limit = 5): Promise<{ messages: IncomingMessage[]; hasMore: boolean }> {
+  async getChatHistory(chatId: string, limit = 5, signal?: AbortSignal): Promise<{ messages: IncomingMessage[]; hasMore: boolean }> {
     if (this.status !== "ready") throw new Error("WhatsApp is not ready");
 
     let chat;
@@ -399,7 +424,7 @@ export class WhatsAppService {
     }
     const hasMore = messages.length > limit;
     const visibleMessages = hasMore ? messages.slice(-limit) : messages;
-    return { messages: await Promise.all(visibleMessages.map(async (message) => {
+    const toIncoming = async (message: (typeof visibleMessages)[number]): Promise<IncomingMessage> => {
       const id = getMessageId(message, `${chatId}:${message.timestamp}:${message.body}`);
       const media = await this.getMedia(message);
       const sender = await this.getSenderName(message);
@@ -433,6 +458,9 @@ export class WhatsAppService {
         if (typeof ownReaction === "string" && ownReaction) {
           reaction = ownReaction;
           this.reactionCache.set(id, ownReaction);
+        } else {
+          reaction = undefined;
+          this.reactionCache.delete(id);
         }
       } catch (error) {
         console.warn("Could not load message reactions", error instanceof Error ? error.message : String(error));
@@ -449,16 +477,35 @@ export class WhatsAppService {
         mediaKind: media?.kind,
         reaction,
         reactions: reactionsList.length > 0 ? reactionsList : undefined,
-        image: media?.kind === "image" ? { dataUrl: media.dataUrl, filename: media.filename } : undefined,
         media
       };
-    })), hasMore };
+    };
+    const history = new Array<IncomingMessage>(visibleMessages.length);
+    let nextIndex = 0;
+    await Promise.all(Array.from({ length: Math.min(4, visibleMessages.length) }, async () => {
+      while (!signal?.aborted && nextIndex < visibleMessages.length) {
+        const index = nextIndex++;
+        history[index] = await toIncoming(visibleMessages[index]);
+      }
+    }));
+    if (signal?.aborted) throw new Error("History request cancelled");
+    return { messages: history, hasMore };
   }
 
   async start(): Promise<void> {
     this.stopping = false;
     console.log("Initializing WhatsApp Web client...");
-    await this.client.initialize();
+    try {
+      await this.client.initialize();
+      if (this.stopping) await this.client.destroy().catch(() => undefined);
+    } catch (error) {
+      if (!this.stopping) {
+        this.status = "disconnected";
+        this.emit({ type: "status", status: this.status });
+        this.scheduleReconnect();
+      }
+      throw error;
+    }
   }
 
   async sendMessage(chatId: string, body: string, quotedMessageId?: string): Promise<void> {
@@ -482,7 +529,19 @@ export class WhatsAppService {
     if (!message) message = await this.client.getMessageById(messageId) as unknown as RuntimeMessage | undefined;
     if (!message) throw new Error("WhatsApp message could not be found");
     if (!message.fromMe) throw new Error("Only your own messages can be deleted");
+    const page = this.client.pupPage;
+    if (!page) throw new Error("WhatsApp browser page is not ready");
+    const canDeleteForEveryone = await page.evaluate(async (targetMessageId: string) => {
+      const runtimeWindow = window as typeof window & { require: (name: string) => any };
+      const msg = runtimeWindow.require("WAWebCollections").Msg.get(targetMessageId)
+        || (await runtimeWindow.require("WAWebCollections").Msg.getMessagesById([targetMessageId]))?.messages?.[0];
+      return Boolean(msg && runtimeWindow.require("WAWebMsgActionCapability").canSenderRevokeMsg(msg));
+    }, getMessageId(message, messageId));
+    if (!canDeleteForEveryone) {
+      throw new Error("WhatsApp no longer permits deleting this message for everyone");
+    }
     await message.delete(true);
+    this.forgetMedia(getMessageId(message, messageId));
     console.log("[whatsapp] message deleted", { chatId, messageId });
   }
 
@@ -541,19 +600,26 @@ export class WhatsAppService {
   private async reconnect(): Promise<void> {
     if (this.stopping || this.reconnecting) return;
     this.reconnecting = true;
+    let retry = false;
     this.status = "starting";
     this.emit({ type: "status", status: this.status });
     try {
       await this.client.destroy().catch(() => undefined);
+      if (this.stopping) return;
       await this.client.initialize();
+      if (this.stopping) {
+        await this.client.destroy().catch(() => undefined);
+        return;
+      }
       console.log("[whatsapp] reconnect attempt started");
     } catch (error) {
       console.error("[whatsapp] reconnect attempt failed", error);
       this.status = "disconnected";
       this.emit({ type: "status", status: this.status });
-      this.scheduleReconnect();
+      retry = true;
     } finally {
       this.reconnecting = false;
+      if (retry || this.getStatus() === "disconnected") this.scheduleReconnect();
     }
   }
 
@@ -580,6 +646,44 @@ export class WhatsAppService {
   }
 
   private async getMedia(message: RuntimeMessage): Promise<IncomingMessage["media"]> {
+    if (!message.hasMedia || !getMediaKind(message)) return undefined;
+    const id = getMessageId(message, "");
+    if (!id) return this.downloadMedia(message);
+    const cached = this.mediaCache.get(id);
+    if (cached) {
+      this.mediaCache.delete(id);
+      this.mediaCache.set(id, cached);
+      return cached;
+    }
+    const pending = this.mediaRequests.get(id);
+    if (pending) return pending;
+    const request: Promise<IncomingMessage["media"]> = this.downloadMedia(message).then((media) => {
+      // Deletion invalidates an in-flight request as well as cached media.
+      if (media && this.mediaRequests.get(id) === request) {
+        const bytes = media.dataUrl.length * 2;
+        if (bytes > 64 * 1024 * 1024) return media;
+        while (this.mediaCache.size && (this.mediaCache.size >= 50 || this.mediaCacheBytes + bytes > 64 * 1024 * 1024)) {
+          this.forgetMedia(this.mediaCache.keys().next().value!);
+        }
+        this.mediaCache.set(id, media);
+        this.mediaCacheBytes += bytes;
+      }
+      return this.mediaRequests.get(id) === request ? media : undefined;
+    }).finally(() => {
+      if (this.mediaRequests.get(id) === request) this.mediaRequests.delete(id);
+    });
+    this.mediaRequests.set(id, request);
+    return request;
+  }
+
+  private forgetMedia(id: string): void {
+    const cached = this.mediaCache.get(id);
+    if (cached) this.mediaCacheBytes -= cached.dataUrl.length * 2;
+    this.mediaCache.delete(id);
+    this.mediaRequests.delete(id);
+  }
+
+  private async downloadMedia(message: RuntimeMessage): Promise<IncomingMessage["media"]> {
     const isSticker = message.type === "sticker";
     const isGif = message.type === "gif" || (message.type === "video" && (message.isGif === true || message._data?.isGif === true));
     const isImage = message.type?.startsWith("image") === true;
@@ -601,12 +705,12 @@ export class WhatsAppService {
     const thumbnail = message._data?.thumbnail;
     // WhatsApp may attach a thumbnail to voice messages, but it is an image
     // preview and cannot be used as the audio source.
-    if (kind !== "audio" && typeof thumbnail === "string" && thumbnail.length > 0) {
+    if (kind === "image" && typeof thumbnail === "string" && thumbnail.length > 0) {
       const dataUrl = thumbnail.startsWith("data:")
         ? thumbnail
-        : `data:${message._data?.mimetype || "image/jpeg"};base64,${thumbnail}`;
+        : `data:image/jpeg;base64,${thumbnail}`;
       console.log("[media] using WhatsApp thumbnail", JSON.stringify({ id: mediaInfo.id, length: thumbnail.length }));
-      return { dataUrl, kind, mimetype: message._data?.mimetype || "image/jpeg" };
+      return { dataUrl, kind, mimetype: dataUrl.slice(5, dataUrl.indexOf(";")) || "image/jpeg" };
     }
 
     try {

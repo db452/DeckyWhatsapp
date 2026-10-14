@@ -77,6 +77,9 @@ app.post("/shutdown", async (_request, response) => {
   response.json({ shuttingDown: true });
   console.log("[bridge] shutdown requested");
   setTimeout(async () => {
+    // Stop accepting work before terminating the tunnel, so its supervisor
+    // observes the stopped bridge and does not reconnect during shutdown.
+    httpServer.close();
     for (const client of clients) client.close();
     clients.clear();
     const stopPromise = whatsapp.stop().catch((error) => console.error("[bridge] WhatsApp shutdown failed", error));
@@ -130,12 +133,28 @@ app.get("/chats/:chatId/profile", async (request, response) => {
 });
 
 app.get("/chats/:chatId/messages", async (request, response) => {
+  const controller = new AbortController();
+  response.on("close", () => { if (!response.writableEnded) controller.abort(); });
   try {
     const rawLimit = Number(request.query.limit);
     const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 100) : 5;
-    response.json(await whatsapp.getChatHistory(request.params.chatId, limit));
+    response.json(await whatsapp.getChatHistory(request.params.chatId, limit, controller.signal));
   } catch (error) {
-    response.status(409).json({ error: error instanceof Error ? error.message : "Unable to load chat history" });
+    if (!response.destroyed) response.status(409).json({ error: error instanceof Error ? error.message : "Unable to load chat history" });
+  }
+});
+
+app.post("/chats/:chatId/read", async (request, response) => {
+  if (shuttingDown) {
+    response.status(503).json({ error: "Bridge is shutting down" });
+    return;
+  }
+  try {
+    const marked = await whatsapp.markChatRead(request.params.chatId);
+    response.json({ marked });
+  } catch (error) {
+    console.error(`[bridge] unable to mark chat ${request.params.chatId} as read`, error);
+    response.status(409).json({ error: error instanceof Error ? error.message : "Unable to mark chat as read" });
   }
 });
 
@@ -201,6 +220,11 @@ app.post("/reactions", async (request, response) => {
 });
 
 socketServer.on("connection", (socket, request) => {
+  socket.on("error", (error) => {
+    console.warn("[bridge] closing failed event connection", error.message);
+    clients.delete(socket);
+    socket.terminate();
+  });
   if (request.url && new URL(request.url, "http://127.0.0.1").searchParams.get("token") !== bridgeToken) {
     socket.close(1008, "Bridge authorization required");
     return;
@@ -225,17 +249,31 @@ whatsapp.onEvent((event) => {
 httpServer.listen(port, host, () => {
   console.log(`Decky WhatsApp bridge listening on http://${host}:${port}`);
   console.log(`WebSocket events available at ws://${host}:${port}/events`);
+  void whatsapp.start().catch((error: unknown) => {
+    console.error("Unable to start WhatsApp Web; recovery scheduled:", error);
+  });
 });
 
-const shutdown = async () => {
-  await whatsapp.stop();
+const serverError = (error: NodeJS.ErrnoException) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(error.code === "EADDRINUSE" ? `Bridge port ${port} is already in use. Close the existing bridge before starting another.` : error);
+  socketServer.close();
   httpServer.close();
+  process.exitCode = 1;
+};
+httpServer.on("error", serverError);
+socketServer.on("error", serverError);
+
+const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const client of clients) client.terminate();
+  clients.clear();
+  socketServer.close();
+  httpServer.close();
+  await whatsapp.stop();
 };
 
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
-
-void whatsapp.start().catch((error: unknown) => {
-  console.error("Unable to start WhatsApp Web:", error);
-  process.exitCode = 1;
-});

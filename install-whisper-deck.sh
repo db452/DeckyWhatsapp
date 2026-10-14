@@ -93,11 +93,20 @@ cmake -S "$SOURCE" -B "$BUILD" \
   -DWHISPER_BUILD_SERVER=OFF
 cmake --build "$BUILD" --config Release -j2
 
-if [[ ! -f "$MODEL" ]]; then
+# A previous interrupted installer may have left a truncated model behind.
+if [[ ! -f "$MODEL" ]] || [[ $(stat -c%s "$MODEL") -lt 100000000 ]]; then
   echo "Downloading the Whisper Base model..."
+  MODEL_DOWNLOAD="$MODEL.download"
+  rm -f "$MODEL_DOWNLOAD"
   curl -L --fail --progress-bar \
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin?download=true" \
-    -o "$MODEL"
+    -o "$MODEL_DOWNLOAD"
+  if [[ $(stat -c%s "$MODEL_DOWNLOAD") -lt 100000000 ]]; then
+    rm -f "$MODEL_DOWNLOAD"
+    echo "The downloaded Whisper model is incomplete." >&2
+    exit 1
+  fi
+  mv "$MODEL_DOWNLOAD" "$MODEL"
 fi
 
 CLI="$BUILD/bin/whisper-cli"

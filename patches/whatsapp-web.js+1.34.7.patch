@@ -1,5 +1,5 @@
 diff --git a/node_modules/whatsapp-web.js/src/structures/Message.js b/node_modules/whatsapp-web.js/src/structures/Message.js
-index 51e9062..e10be8c 100644
+index 51e9062..cf88333 100644
 --- a/node_modules/whatsapp-web.js/src/structures/Message.js
 +++ b/node_modules/whatsapp-web.js/src/structures/Message.js
 @@ -365,7 +365,7 @@ class Message extends Base {
@@ -56,6 +56,37 @@ index 51e9062..e10be8c 100644
          } catch (err) {
              await blobHandle.dispose().catch(() => {});
              throw err;
+@@ -607,13 +607,8 @@ class Message extends Base {
+     async delete(everyone, clearMedia = true) {
+         await this.client.pupPage.evaluate(
+             async (msgId, everyone, clearMedia) => {
+-                const msg =
+-                    window.require('WAWebCollections').Msg.get(msgId) ||
+-                    (
+-                        await window
+-                            .require('WAWebCollections')
+-                            .Msg.getMessagesById([msgId])
+-                    )?.messages?.[0];
++                const msg = await window.WWebJS.getMessageById(msgId);
++                if (!msg) throw new Error('WhatsApp message could not be found for deletion');
+                 const chat =
+                     window
+                         .require('WAWebCollections')
+@@ -652,3 +647,5 @@ class Message extends Base {
++                if (everyone) throw new Error('WhatsApp no longer permits deleting this message for everyone');
++
+                 return window.WWebJS.compareWwebVersions(
+                     window.Debug.VERSION,
+                     '>=',
+@@ -661,7 +658,7 @@ class Message extends Base {
+                       )
+                     : Cmd.sendDeleteMsgs(chat, [msg], clearMedia);
+             },
+-            this.id._serialized,
++            this.id,
+             everyone,
+             clearMedia,
+         );
 diff --git a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
 index 3c1d698..fa7ce8c 100644
 --- a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js

@@ -21,7 +21,7 @@ the [Steam Deck SSH setup guide](https://github.com/popsUlfr/steam-deck-tricks/b
 
 ## Requirements
 
-- Windows PC with Node.js 20 or newer.
+- Windows PC with Node.js 20 or newer and Git for Windows.
 - A WhatsApp account that can link a companion device.
 - Steam Deck with Decky Loader installed.
 - PC and Steam Deck connected to the same network.
@@ -29,7 +29,7 @@ the [Steam Deck SSH setup guide](https://github.com/popsUlfr/steam-deck-tricks/b
 
 ## Compatibility
 
-- Windows PC with Node.js 20 or newer.
+- Windows PC with Node.js 20 or newer and Git for Windows.
 - Steam Deck running SteamOS with Decky Loader.
 - A current WhatsApp account with companion-device linking available.
 - The PC and Deck must be able to reach each other on the same local network.
@@ -40,7 +40,11 @@ components remain subject to their own licenses and terms.
 
 ## First download: install and start the release
 
-Download both release archives:
+Download the PC and Decky plugin ZIPs from the
+[latest GitHub release](https://github.com/db452/DeckyWhatsapp/releases/latest).
+The PC ZIP is named `decky-whatsapp-pc-*.zip`; the plugin ZIP is named
+`decky-whatsapp-decky-plugin-*.zip`. The optional Whisper installer is included
+inside the PC ZIP.
 
 Extract the PC release ZIP to a permanent folder on the Windows PC. Keep all
 of its files together. Install the Decky plugin release ZIP through Decky
@@ -56,9 +60,9 @@ This is the recommended path for most users.
 powershell -ExecutionPolicy Bypass -File .\install-decky-whatsapp-windows.ps1
 ```
 
-The installer checks for Node.js and Windows OpenSSH, installs the PC bridge
+The installer checks for Node.js, Git, and Windows OpenSSH, installs the PC bridge
 dependencies, creates the SSH key used by the launcher, and creates shortcuts.
-If Node.js is missing and `winget` is available, it can install Node.js LTS
+If Node.js or Git is missing and `winget` is available, it can install them
 automatically.
 
 2. Install the public SSH key on the Deck if you want passwordless startup:
@@ -85,7 +89,7 @@ then stored locally on the PC.
 Use this path if you prefer to install prerequisites and start each component
 yourself.
 
-1. Install Node.js 20 or newer and ensure Windows OpenSSH is available.
+1. Install Node.js 20 or newer and Git for Windows, and ensure Windows OpenSSH is available.
 2. Open PowerShell in the extracted PC package folder and install dependencies:
 
 ```powershell
@@ -165,8 +169,11 @@ Check that the PC bridge is running and that the SSH tunnel is still open.
 From the PC, verify the bridge with:
 
 ```powershell
-curl http://127.0.0.1:8787/health
+$bridgeToken = (Invoke-RestMethod -Uri http://127.0.0.1:8787/bootstrap -Headers @{ Origin = 'https://steamloopback.host' }).token
+(Invoke-RestMethod -Uri http://127.0.0.1:8787/health -Headers @{ Authorization = "Bearer $bridgeToken" }).status
 ```
+
+This reports the bridge's WhatsApp state. Keep the token private.
 
 If the tunnel was closed or the Deck’s IP address changed, restart
 [`start-decky-whatsapp.bat`](./start-decky-whatsapp.bat) and enter the current
