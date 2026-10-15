@@ -1,3 +1,4 @@
+# Decky backend for optional local Whisper voice transcription.
 import asyncio
 import base64
 import binascii
@@ -106,6 +107,7 @@ def _transcribe(wav_data: bytes) -> str:
         return transcript
 
 
+# Expose Decky RPC entry points; transcription work runs on a worker thread.
 class Plugin:
     async def _main(self):
         pass

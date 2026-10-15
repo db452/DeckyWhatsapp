@@ -1,3 +1,4 @@
+// Adapts whatsapp-web.js with LocalAuth, message enrichment, and reconnect recovery.
 import qrcode from "qrcode";
 import qrcodeTerminal from "qrcode-terminal";
 import pkg from "whatsapp-web.js";
@@ -387,6 +388,7 @@ export class WhatsAppService {
     }
   }
 
+  // Load the latest history window and enrich messages with media and reactions.
   async getChatHistory(chatId: string, limit = 5, signal?: AbortSignal): Promise<{ messages: IncomingMessage[]; hasMore: boolean }> {
     if (this.status !== "ready") throw new Error("WhatsApp is not ready");
 
@@ -574,6 +576,7 @@ export class WhatsAppService {
     console.log("[whatsapp] reaction dispatched", { chatId, messageId: serializedId, emoji });
   }
 
+  // Shutdown cancels retries; recovery reinitializes the client with bounded backoff.
   async stop(): Promise<void> {
     this.stopping = true;
     if (this.reconnectTimer) {
@@ -645,6 +648,7 @@ export class WhatsAppService {
     }
   }
 
+  // Share in-flight downloads and reuse cached media across concurrent history reads.
   private async getMedia(message: RuntimeMessage): Promise<IncomingMessage["media"]> {
     if (!message.hasMedia || !getMediaKind(message)) return undefined;
     const id = getMessageId(message, "");

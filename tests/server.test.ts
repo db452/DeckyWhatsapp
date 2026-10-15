@@ -1,3 +1,4 @@
+// Exercise bridge startup and API behavior with local processes and ports; no real Deck is contacted.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
@@ -24,4 +25,92 @@ test("an occupied port exits cleanly before starting WhatsApp", { timeout: 10_00
   assert.equal(code, 1);
   assert.match(output, /already in use/);
   assert.doesNotMatch(output, /UNEXPECTED_BROWSER_START|Unhandled/);
+});
+
+test("health exposes a runtime session ID only after bridge authentication", { timeout: 10_000 }, async (t) => {
+  const reservation = createServer();
+  reservation.listen(0, "127.0.0.1");
+  await once(reservation, "listening");
+  const address = reservation.address();
+  assert.ok(address && typeof address !== "string");
+  await new Promise<void>((resolve, reject) => reservation.close((error) => error ? reject(error) : resolve()));
+
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
+    import { WhatsAppService } from './src/whatsapp.ts';
+    WhatsAppService.prototype.start = async () => {};
+    await import('./src/server.ts');
+  `], { env: { ...process.env, PORT: String(address.port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => child.kill());
+  let output = "";
+  let ready!: () => void;
+  const listening = new Promise<void>((resolve) => { ready = resolve; });
+  const append = (chunk: Buffer) => {
+    output += chunk.toString();
+    if (output.includes("bridge listening")) ready();
+  };
+  child.stdout.on("data", append);
+  child.stderr.on("data", append);
+  await listening;
+
+  const url = `http://127.0.0.1:${address.port}`;
+  const bootstrap = await fetch(`${url}/bootstrap`, { headers: { Origin: "https://steamloopback.host" } });
+  const { token } = await bootstrap.json() as { token: string };
+  const unauthorized = await fetch(`${url}/health`);
+  assert.equal(unauthorized.status, 401);
+  const response = await fetch(`${url}/health`, { headers: { Authorization: `Bearer ${token}` } });
+  const health = await response.json() as { ok: boolean; sessionId: string };
+  assert.equal(health.ok, true);
+  assert.match(health.sessionId, /^[0-9a-f-]{36}$/i);
+  assert.notEqual(health.sessionId, token);
+});
+
+test("a second bridge binding fails without replacing the first active session", { timeout: 10_000 }, async (t) => {
+  const reservation = createServer();
+  reservation.listen(0, "127.0.0.1");
+  await once(reservation, "listening");
+  const address = reservation.address();
+  assert.ok(address && typeof address !== "string");
+  await new Promise<void>((resolve, reject) => reservation.close((error) => error ? reject(error) : resolve()));
+
+  const source = `
+    import { WhatsAppService } from './src/whatsapp.ts';
+    WhatsAppService.prototype.start = async () => {};
+    await import('./src/server.ts');
+  `;
+  const startBridge = () => spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", source], {
+    env: { ...process.env, PORT: String(address.port), HOST: "127.0.0.1" },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  const first = startBridge();
+  t.after(() => first.kill());
+  let firstOutput = "";
+  let firstReady!: () => void;
+  const firstListening = new Promise<void>((resolve) => { firstReady = resolve; });
+  const appendFirst = (chunk: Buffer) => {
+    firstOutput += chunk.toString();
+    if (firstOutput.includes("bridge listening")) firstReady();
+  };
+  first.stdout.on("data", appendFirst);
+  first.stderr.on("data", appendFirst);
+  await firstListening;
+
+  const url = `http://127.0.0.1:${address.port}`;
+  const bootstrap = await fetch(`${url}/bootstrap`, { headers: { Origin: "https://steamloopback.host" } });
+  const { token } = await bootstrap.json() as { token: string };
+  const headers = { Authorization: `Bearer ${token}` };
+  const originalHealth = await fetch(`${url}/health`, { headers });
+  const originalSession = (await originalHealth.json() as { sessionId: string }).sessionId;
+
+  const second = startBridge();
+  let secondOutput = "";
+  second.stdout.on("data", (chunk) => { secondOutput += chunk.toString(); });
+  second.stderr.on("data", (chunk) => { secondOutput += chunk.toString(); });
+  const [secondExitCode] = await once(second, "close");
+  assert.equal(secondExitCode, 1);
+  assert.match(secondOutput, /already in use/);
+
+  const survivingHealth = await fetch(`${url}/health`, { headers });
+  const survivingSession = (await survivingHealth.json() as { sessionId: string }).sessionId;
+  assert.equal(survivingSession, originalSession);
+  assert.equal(first.exitCode, null);
 });

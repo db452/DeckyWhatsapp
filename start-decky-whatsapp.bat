@@ -1,4 +1,5 @@
 @echo off
+REM Deliberately start the PC bridge and supervise its Steam Deck SSH tunnel.
 setlocal
 
 set "PROJECT_DIR=%~dp0"
@@ -24,29 +25,14 @@ if not defined DECK_HOST (
 
 echo Steam Deck found at %DECK_HOST%.
 
-set "DECK_PORT_BUSY="
-if exist "%DECK_KEY%" (
-    for /f "delims=" %%P in ('ssh -i "%DECK_KEY%" -o IdentitiesOnly=yes %DECK_USER%@%DECK_HOST% "ss -ltn ^| grep -q ':%BRIDGE_PORT% ' ^&^& echo BUSY" 2^>nul') do set "DECK_PORT_BUSY=%%P"
-) else (
-    for /f "delims=" %%P in ('ssh %DECK_USER%@%DECK_HOST% "ss -ltn ^| grep -q ':%BRIDGE_PORT% ' ^&^& echo BUSY" 2^>nul') do set "DECK_PORT_BUSY=%%P"
-)
-
-if defined DECK_PORT_BUSY (
-    echo An old tunnel is using Deck port %BRIDGE_PORT%. Clearing it...
-    if exist "%DECK_KEY%" (
-        ssh -i "%DECK_KEY%" -o IdentitiesOnly=yes -t %DECK_USER%@%DECK_HOST% "sudo fuser -k %BRIDGE_PORT%/tcp"
-    ) else (
-        ssh -t %DECK_USER%@%DECK_HOST% "sudo fuser -k %BRIDGE_PORT%/tcp"
-    )
-)
-
-echo Starting the WhatsApp bridge...
-powershell.exe -NoProfile -Command "$ErrorActionPreference = 'Stop'; $connection = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort %BRIDGE_PORT% -State Listen -ErrorAction SilentlyContinue; if (-not $connection) { exit 0 }; try { $bridgePid = $connection[0].OwningProcess; $url = 'http://127.0.0.1:%BRIDGE_PORT%'; $bootstrap = Invoke-RestMethod ($url + '/bootstrap') -Headers @{ Origin = 'https://steamloopback.host' } -TimeoutSec 5; if ($bootstrap.token -notmatch '^[a-f0-9]{64}$') { throw 'The port is occupied by an unrecognized service.' }; $headers = @{ Authorization = ('Bearer ' + $bootstrap.token) }; $health = Invoke-RestMethod ($url + '/health') -Headers $headers -TimeoutSec 5; if ($health.ok -ne $true -or -not $health.status) { throw 'The port is occupied by an unrecognized service.' }; Write-Host 'Stopping the previous bridge cleanly...'; Invoke-RestMethod ($url + '/shutdown') -Method Post -Headers $headers -TimeoutSec 5 | Out-Null; for ($attempt = 0; $attempt -lt 24; $attempt++) { if (-not (Get-Process -Id $bridgePid -ErrorAction SilentlyContinue)) { exit 0 }; Start-Sleep -Milliseconds 500 }; throw 'The previous bridge has not stopped yet. Close its window and try again.' } catch { Write-Host $_.Exception.Message; exit 1 }"
+echo Checking the local bridge port...
+powershell.exe -NoProfile -Command "$client = New-Object System.Net.Sockets.TcpClient; try { $pending = $client.BeginConnect('127.0.0.1', %BRIDGE_PORT%, $null, $null); if ($pending.AsyncWaitHandle.WaitOne(500)) { $client.EndConnect($pending); Write-Host 'A bridge or another service is already using local port %BRIDGE_PORT%.'; Write-Host 'The launcher will leave it running. Close its window explicitly before starting another session.'; exit 1 } } catch { } finally { $client.Close() }"
 if errorlevel 1 (
-    echo Could not safely restart the PC bridge. Close the existing bridge window, then try again.
     pause
     exit /b 1
 )
+
+echo Starting the WhatsApp bridge...
 start "Decky WhatsApp bridge" /D "%PROJECT_DIR%" cmd /c "npm.cmd start"
 
 echo Waiting for the bridge to start...

@@ -1,3 +1,4 @@
+// Test WhatsAppService behavior with mocked clients and messages; no real account is contacted.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { test } from "node:test";

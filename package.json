@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "test": "node --import tsx --test src/whatsapp.test.ts tests/connection.test.ts tests/server.test.ts",
+    "test": "node --import tsx --test src/whatsapp.test.ts tests/connection.test.ts tests/connection-state.test.ts tests/format.test.ts tests/server.test.ts tests/tunnel.test.ts",
     "typecheck": "tsc --noEmit",
     "postinstall": "patch-package"
   },

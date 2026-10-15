@@ -1,3 +1,4 @@
+// Shared bridge event, chat, and message data shapes.
 export type BridgeStatus =
   | "starting"
   | "qr_required"

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Build and install optional local Whisper support for Deck voice typing.
 set -euo pipefail
 
 ROOT="$HOME/.local/share/decky-whatsapp/voice"
@@ -18,6 +19,7 @@ restore_steamos_readonly() {
   fi
 }
 
+# On exit, attempt to restore read-only mode if this run disabled it.
 trap restore_steamos_readonly EXIT
 
 mkdir -p "$ROOT/models"
@@ -118,6 +120,7 @@ if [[ ! -x "$CLI" ]]; then
   exit 1
 fi
 
+# Save the executable and model paths consumed by the Decky backend.
 printf '%s\n' "$CLI" > "$ROOT/whisper-cli.path"
 printf '%s\n' "$MODEL" > "$ROOT/model.path"
 

@@ -1,8 +1,8 @@
+// HTTP and WebSocket bridge between the Decky plugin and WhatsAppService.
 import "dotenv/config";
 import express from "express";
 import { createServer } from "node:http";
-import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { WebSocketServer, type WebSocket } from "ws";
 import { WhatsAppService } from "./whatsapp.js";
 import type { BridgeEvent } from "./types.js";
@@ -16,6 +16,7 @@ const port = Number(process.env.PORT ?? 8787);
 // A new token is created for each bridge process. It is bootstrapped only over
 // the local/reverse-tunnel connection and is never embedded in the plugin.
 const bridgeToken = randomBytes(32).toString("hex");
+const sessionId = randomUUID();
 const allowedOrigins = new Set([
   "https://steamloopback.host",
   "http://steamloopback.host",
@@ -29,6 +30,7 @@ const whatsapp = new WhatsAppService();
 const clients = new Set<WebSocket>();
 let shuttingDown = false;
 
+// HTTP origin checks, preflight handling, and bearer-token authentication.
 app.use(express.json({ limit: "32kb" }));
 app.use((request, response, next) => {
   const origin = request.header("Origin");
@@ -65,7 +67,7 @@ app.get("/bootstrap", (_request, response) => {
 });
 
 app.get("/health", (_request, response) => {
-  response.json({ ok: true, status: whatsapp.getStatus() });
+  response.json({ ok: true, status: whatsapp.getStatus(), sessionId });
 });
 
 app.post("/shutdown", async (_request, response) => {
@@ -77,8 +79,7 @@ app.post("/shutdown", async (_request, response) => {
   response.json({ shuttingDown: true });
   console.log("[bridge] shutdown requested");
   setTimeout(async () => {
-    // Stop accepting work before terminating the tunnel, so its supervisor
-    // observes the stopped bridge and does not reconnect during shutdown.
+    // Close bridge listeners so the tunnel supervisor can observe that its local target has stopped.
     httpServer.close();
     for (const client of clients) client.close();
     clients.clear();
@@ -87,13 +88,6 @@ app.post("/shutdown", async (_request, response) => {
       stopPromise,
       new Promise<void>((resolve) => setTimeout(resolve, 3000))
     ]);
-    if (process.platform === "win32") {
-      execFile("powershell.exe", [
-        "-NoProfile",
-        "-Command",
-        "$tunnels = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'ssh.exe' -and $_.CommandLine -match '-R 8787:127.0.0.1:8787' }; $tunnels | Invoke-CimMethod -MethodName Terminate"
-      ], () => undefined);
-    }
     socketServer.close();
     httpServer.close();
     setTimeout(() => process.exit(0), 1000);
@@ -219,6 +213,7 @@ app.post("/reactions", async (request, response) => {
   }
 });
 
+// WebSocket connections and live bridge-event delivery.
 socketServer.on("connection", (socket, request) => {
   socket.on("error", (error) => {
     console.warn("[bridge] closing failed event connection", error.message);
@@ -246,6 +241,7 @@ whatsapp.onEvent((event) => {
   }
 });
 
+// Listener startup, port conflicts, and process shutdown.
 httpServer.listen(port, host, () => {
   console.log(`Decky WhatsApp bridge listening on http://${host}:${port}`);
   console.log(`WebSocket events available at ws://${host}:${port}/events`);

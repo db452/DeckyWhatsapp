@@ -181,9 +181,12 @@ Deck IP when prompted.
 
 ### The SSH tunnel reports “remote port forwarding failed”
 
-Port `8787` is already being used on the Deck, usually by an old tunnel. Close
-the old launcher or SSH window, then run the launcher again. If necessary, use
-the Deck to find and stop the stale SSH process before reconnecting.
+SSH could not establish remote forwarding on port `8787`. The port may be in
+use by another DeckyWhatsapp bridge or another service, or the Deck's SSH
+server may restrict remote forwarding. Check whether another bridge you own is
+already connected and ask the Deck administrator to check its SSH forwarding
+policy. The launcher will not stop remote processes; do not terminate an SSH
+process unless you have identified and confirmed it is yours.
 
 ### SSH keeps asking for a password
 
