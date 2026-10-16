@@ -133,9 +133,11 @@ export class WhatsAppService {
 
     this.client.on("qr", async (qr) => {
       this.status = "qr_required";
-      console.log("\nScan this QR code from WhatsApp on your phone:\n");
-      qrcodeTerminal.generate(qr, { small: true });
-      console.log();
+      if (process.env.DECKY_WHATSAPP_BACKGROUND !== "1") {
+        console.log("\nScan this QR code from WhatsApp on your phone:\n");
+        qrcodeTerminal.generate(qr, { small: true });
+        console.log();
+      }
       this.emit({ type: "status", status: this.status });
       this.emit({ type: "qr", dataUrl: await qrcode.toDataURL(qr) });
     });
@@ -231,8 +233,8 @@ export class WhatsAppService {
         const chat = await message.getChat();
         chatId = chat.id._serialized;
         chatName = chat.name || chat.id.user || message.from;
-      } catch (error) {
-        console.error("Could not load WhatsApp chat metadata; using message sender as chat ID", error);
+      } catch {
+        console.warn("[message] chat metadata lookup failed; using sender fallback");
       }
 
       // Keep background synchronization lightweight. Full media is fetched
@@ -257,8 +259,8 @@ export class WhatsAppService {
       this.recentMessages.splice(50);
       console.log(`Synchronized WhatsApp message from ${incoming.sender} in ${incoming.chatName}`);
       this.emit({ type: "message", message: incoming });
-    } catch (error) {
-      console.error("Unable to synchronize created WhatsApp message", error);
+    } catch {
+      console.error("[message] created message synchronization failed");
     }
   }
 
@@ -271,8 +273,8 @@ export class WhatsAppService {
         const chat = await message.getChat();
         chatId = chat.id._serialized;
         chatName = chat.name || chat.id.user || message.from;
-      } catch (error) {
-        console.warn("Could not load chat metadata while synchronizing message update", error);
+      } catch {
+        console.warn("[message] chat metadata lookup failed while synchronizing update");
       }
 
       const media = undefined;
@@ -291,8 +293,8 @@ export class WhatsAppService {
       };
       this.emit({ type: "message_update", update, message: updatedMessage });
       console.log("Synchronized WhatsApp message update", { update, chatId, messageId: updatedMessage.id });
-    } catch (error) {
-      console.error("Unable to synchronize WhatsApp message update", error);
+    } catch {
+      console.error("[message] update synchronization failed");
     }
   }
 
@@ -317,8 +319,8 @@ export class WhatsAppService {
       let chats;
       try {
         chats = await this.client.getChats();
-      } catch (firstError) {
-        console.warn("[chats] first WhatsApp chat request failed; retrying", firstError);
+      } catch {
+        console.warn("[chats] first WhatsApp chat request failed; retrying");
         await new Promise((resolve) => setTimeout(resolve, 750));
         chats = await this.client.getChats();
       }
@@ -333,8 +335,8 @@ export class WhatsAppService {
           unreadCount: chat.unreadCount ?? 0
         }));
       return { chats: limit ? mappedChats.slice(0, limit) : mappedChats, hasMore: Boolean(limit && mappedChats.length > limit) };
-    } catch (error) {
-      console.error("[chats] unable to load recent WhatsApp chats", error);
+    } catch {
+      console.error("[chats] unable to load recent WhatsApp chats");
       return this.getFallbackChats();
     }
   }
@@ -351,7 +353,7 @@ export class WhatsAppService {
         if (attempt === 1) await new Promise((resolve) => setTimeout(resolve, 500));
       } catch (error) {
         lastError = error;
-        console.warn(`[read] failed to mark ${chatId} as read (attempt ${attempt})`, error);
+        console.warn(`[read] failed to mark chat as read (attempt ${attempt})`);
         if (attempt === 1) await new Promise((resolve) => setTimeout(resolve, 500));
       }
     }
@@ -383,7 +385,7 @@ export class WhatsAppService {
       console.log(`[profile] ${chatId}: received`, { contentType, bytes: imageData.length });
       return dataUrl;
     } catch (error) {
-      console.warn(`[profile] lookup failed for ${chatId}`, error);
+      console.warn("[profile] profile picture lookup failed");
       throw error;
     }
   }
@@ -396,12 +398,12 @@ export class WhatsAppService {
     try {
       chat = await this.client.getChatById(chatId);
     } catch (lookupError) {
-      console.warn(`[history] direct chat lookup failed for ${chatId}; searching loaded chats`, lookupError);
+      console.warn("[history] direct chat lookup failed; searching loaded chats");
       let chats;
       try {
         chats = await this.client.getChats();
-      } catch (firstChatsError) {
-        console.warn(`[history] loaded chat search failed for ${chatId}; retrying`, firstChatsError);
+      } catch {
+        console.warn("[history] loaded chat search failed; retrying");
         await new Promise((resolve) => setTimeout(resolve, 750));
         chats = await this.client.getChats();
       }
@@ -421,7 +423,7 @@ export class WhatsAppService {
     try {
       messages = await chat.fetchMessages({ limit: limit + 1 });
     } catch (historyError) {
-      console.error(`[history] message retrieval failed for ${chatId}`, historyError);
+      console.error("[history] message retrieval failed");
       throw historyError;
     }
     const hasMore = messages.length > limit;
@@ -464,8 +466,8 @@ export class WhatsAppService {
           reaction = undefined;
           this.reactionCache.delete(id);
         }
-      } catch (error) {
-        console.warn("Could not load message reactions", error instanceof Error ? error.message : String(error));
+      } catch {
+        console.warn("[history] message reaction lookup failed");
       }
       return {
         id,
@@ -584,8 +586,8 @@ export class WhatsAppService {
       this.reconnectTimer = undefined;
     }
     this.reconnectAttempt = 0;
-    await this.client.destroy().catch((error) => {
-      console.warn("WhatsApp client was already stopped", error instanceof Error ? error.message : String(error));
+    await this.client.destroy().catch(() => {
+      console.warn("[whatsapp] client shutdown reported an error");
     });
   }
 
@@ -615,8 +617,8 @@ export class WhatsAppService {
         return;
       }
       console.log("[whatsapp] reconnect attempt started");
-    } catch (error) {
-      console.error("[whatsapp] reconnect attempt failed", error);
+    } catch {
+      console.error("[whatsapp] reconnect attempt failed");
       this.status = "disconnected";
       this.emit({ type: "status", status: this.status });
       retry = true;
@@ -640,8 +642,8 @@ export class WhatsAppService {
       const name = contact.name || contact.pushname || contact.shortName || contact.verifiedName || message.author || message.from;
       this.contactNameCache.set(cacheKey, name);
       return name;
-    } catch (error) {
-      console.warn("Could not resolve WhatsApp contact name", error instanceof Error ? error.message : String(error));
+    } catch {
+      console.warn("[message] contact name lookup failed; using sender fallback");
       const fallback = message.author || message.from;
       this.contactNameCache.set(cacheKey, fallback);
       return fallback;
@@ -733,11 +735,8 @@ export class WhatsAppService {
         kind,
         mimetype: media.mimetype
       };
-    } catch (error) {
-      console.error("[media] full media failed", JSON.stringify({
-        id: mediaInfo.id,
-        error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error)
-      }));
+    } catch {
+      console.error("[media] full media download failed");
       return undefined;
     }
   }

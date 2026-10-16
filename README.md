@@ -13,6 +13,7 @@ The project contains:
 - The PC bridge in [`src/`](./src/), which exposes the WhatsApp Web session.
 - The Decky plugin in [`decky-plugin/`](./decky-plugin/).
 - The normal Windows launcher in [`start-decky-whatsapp.bat`](./start-decky-whatsapp.bat).
+- The Linux installer and launcher for supported x86_64 desktop systems.
 
 ## Set up SSH on the Steam Deck
 
@@ -21,7 +22,7 @@ the [Steam Deck SSH setup guide](https://github.com/popsUlfr/steam-deck-tricks/b
 
 ## Requirements
 
-- Windows PC with Node.js 20 or newer and Git for Windows.
+- Windows PC with Node.js 22 or newer and Git for Windows, or a supported Linux PC (Ubuntu/Debian x86_64) with Node.js 22 or newer.
 - A WhatsApp account that can link a companion device.
 - Steam Deck with Decky Loader installed.
 - PC and Steam Deck connected to the same network.
@@ -29,7 +30,8 @@ the [Steam Deck SSH setup guide](https://github.com/popsUlfr/steam-deck-tricks/b
 
 ## Compatibility
 
-- Windows PC with Node.js 20 or newer and Git for Windows.
+- Windows PC with Node.js 22 or newer and Git for Windows.
+- Linux companion target: Ubuntu or Debian x86_64 with Node.js 22 or newer; Node.js 24 LTS is recommended. Linux ARM, Fedora, SteamOS, and other distributions are not currently supported targets.
 - Steam Deck running SteamOS with Decky Loader.
 - A current WhatsApp account with companion-device linking available.
 - The PC and Deck must be able to reach each other on the same local network.
@@ -38,13 +40,21 @@ The bridge uses a pinned `whatsapp-web.js` revision and a small compatibility
 patch because WhatsApp Web changes over time. Third-party packages and bundled
 components remain subject to their own licenses and terms.
 
+Companion releases use separate assets: `decky-whatsapp-pc-windows-*.zip` for
+Windows and `decky-whatsapp-pc-linux-*.zip` for supported Linux systems. The
+Decky plugin ZIP is a separate asset. Older releases may still contain the
+legacy Windows name `decky-whatsapp-pc-*.zip`. Linux install steps and
+troubleshooting are in the [Linux companion guide](./docs/LINUX.md).
+
 ## First download: install and start the release
 
-Download the PC and Decky plugin ZIPs from the
+Download the Windows PC ZIP and Decky plugin ZIPs from the
 [latest GitHub release](https://github.com/db452/DeckyWhatsapp/releases/latest).
-The PC ZIP is named `decky-whatsapp-pc-*.zip`; the plugin ZIP is named
-`decky-whatsapp-decky-plugin-*.zip`. The optional Whisper installer is included
-inside the PC ZIP.
+The Windows PC ZIP is named `decky-whatsapp-pc-windows-*.zip`; the plugin ZIP
+is named `decky-whatsapp-decky-plugin-*.zip`. The optional Whisper installer is
+included inside the Windows PC ZIP. Older releases may have the legacy Windows
+package name `decky-whatsapp-pc-*.zip`. Linux users should download the distinct
+`decky-whatsapp-pc-linux-*.zip` archive and follow the Linux guide below.
 
 Extract the PC release ZIP to a permanent folder on the Windows PC. Keep all
 of its files together. Install the Decky plugin release ZIP through Decky
@@ -84,6 +94,32 @@ Keep the bridge and tunnel windows open while using the plugin. On the first
 start, link WhatsApp Web by scanning the QR code if requested. The session is
 then stored locally on the PC.
 
+### Optional background operation
+
+If you have non-interactive SSH authentication configured, you can start the
+bridge and tunnel without keeping console windows open. This is still a manual
+action and does not create a login task or Windows service. Background mode
+uses SSH batch mode so it never waits invisibly for a password or key passphrase;
+password-only SSH users should keep using `start-decky-whatsapp.bat`.
+
+Open PowerShell in the extracted PC package folder and run:
+
+```powershell
+.\manage-decky-whatsapp.ps1 Start
+.\manage-decky-whatsapp.ps1 Status
+.\manage-decky-whatsapp.ps1 Logs
+.\manage-decky-whatsapp.ps1 Stop
+```
+
+`Start` discovers `steamdeck.lan` and asks for an address if discovery fails.
+When the Deck is found by hostname, the tunnel re-resolves that name when it
+reconnects after sleep or a network interruption. If you entered an IP address
+and that address changes, stop the background session and start it again with
+the Deck's current IP. The status command reports whether the bridge and tunnel
+supervisor are running; inspect the tunnel log to see whether SSH is connected
+or retrying. Logs and process ownership records are stored under
+`%LOCALAPPDATA%\DeckyWhatsapp\background`.
+
 ### Manual setup
 
 Use this path if you prefer to install prerequisites and start each component
@@ -113,6 +149,20 @@ Keep both windows open while using the plugin. The first WhatsApp Web start
 may ask you to link the device by scanning a QR code. The linked session is
 stored locally in `.wwebjs_auth/`; keep that directory private.
 
+## Linux companion
+
+The initial Linux target is Ubuntu/Debian on x86_64 with Node.js 22 or newer
+(Node.js 24 LTS recommended). Linux ARM, Fedora, SteamOS, and other
+distributions are not supported until their browser dependencies and bridge
+runtime are validated. Download only the `decky-whatsapp-pc-linux-*.zip` asset;
+it is distinct from the Windows ZIP and Decky plugin ZIP.
+
+Follow [the Linux installation and troubleshooting guide](./docs/LINUX.md).
+The installer asks before refreshing apt metadata or installing the exact
+missing Ubuntu/Debian packages it has resolved. It does not install Node.js
+globally, create a system service, or configure login autostart. Start the
+bridge only when you deliberately run `./start-decky-whatsapp-linux.sh`.
+
 ## Install the Decky plugin
 
 Copy the supplied plugin ZIP to the Deck and install it through Decky Loader.
@@ -138,13 +188,16 @@ and continues working normally when it is not installed.
 
 The project includes [install-whisper-deck.sh](./install-whisper-deck.sh) as an
 optional beta convenience installer. Run it only if you want to test voice
-recognition. It may ask for your Deck password, temporarily unlock SteamOS
-while installing build tools, restore read-only mode, build Whisper locally,
-and download its speech model. This requires an internet connection and
-several hundred megabytes of temporary and model storage.
+recognition. Run it from your normal `deck` account, without `sudo`; it invokes
+sudo only for system package operations. It may temporarily unlock SteamOS while
+installing build tools, then restores read-only mode before building Whisper
+locally and downloading its speech model. This requires an internet connection,
+Git, and several hundred megabytes of temporary and model storage. The installer
+checks out a pinned Whisper release and verifies the model against the upstream
+SHA-1 listed by its model card.
 
 Voice recordings are transcribed locally on the Deck. The installer does not
-install a Whisper server and does not require Git.
+install a Whisper server.
 
 ## SSH reverse tunnel
 
@@ -160,6 +213,55 @@ Deck, enter its current IP address when prompted.
 
 The bridge itself binds to `127.0.0.1` by default. Keep that setting so the
 WhatsApp service is not exposed directly to other devices on the network.
+
+### Clear a stale reverse-forward port
+
+The Windows launcher can make one automatic retry when the remote port owner
+cannot be identified. It waits 60 seconds for the Deck's SSH server to expire a
+disconnected client, verifies that the same local bridge process is still
+listening, then retries once without prompting for another password. It never
+stops a remote process. This recovery requires the Deck SSH server to check
+unresponsive clients; `ClientAliveInterval 15` with
+`ClientAliveCountMax 3` expires them in about 45 seconds.
+
+The one-time retry uses OpenSSH verbose output to confirm the remote forward was
+established. If SSH exits before that confirmation, the launcher stops with
+diagnostic guidance. After confirmation, it returns to normal tunnel
+supervision and reconnect behavior.
+
+For the foreground Windows launcher, the local listener PID and process start
+time are checked on Windows before retrying. This only verifies the PC bridge;
+it does not identify or provide evidence about a process on the Deck. If the
+one-time retry cannot authenticate in SSH batch mode, it stops with guidance
+instead of prompting again or looping. Password-only SSH or a key requiring an
+unavailable passphrase may therefore need you to stop and restart the launcher
+manually after the Deck clears the stale connection.
+
+To enable those SSH server settings, run these commands in a Steam Deck desktop
+terminal. They add a global SSH server setting, validate it, reload `sshd`,
+and print the effective values:
+
+```sh
+printf 'ClientAliveInterval 15\nClientAliveCountMax 3\n' | sudo tee /etc/ssh/sshd_config.d/99-decky-whatsapp-stale-tunnel.conf
+sudo sshd -t && sudo systemctl reload sshd.service
+sudo sshd -T | grep -E '^(clientaliveinterval|clientalivecountmax) '
+```
+
+The output should show `clientaliveinterval 15` and
+`clientalivecountmax 3`. If validation or the service reload fails, remove the
+drop-in and reload the SSH service to restore the prior configuration:
+
+```sh
+sudo rm /etc/ssh/sshd_config.d/99-decky-whatsapp-stale-tunnel.conf
+sudo systemctl reload sshd.service
+```
+
+Reload applies the settings to new SSH sessions; it does not retroactively
+expire a connection established before the change. If a port is already held
+by such a connection, diagnose its owner separately and verify ownership before
+any cleanup. The launcher will not terminate a remote process based on its port.
+These settings apply to all SSH clients on the Deck; a live but unresponsive
+SSH client will be closed after roughly 45 seconds.
 
 ## Common issues
 
@@ -254,3 +356,9 @@ Third-party dependencies remain subject to their own licenses; see the
 
 See [SECURITY.md](./docs/SECURITY.md) for reporting guidance and a list of data
 that must remain private.
+
+### AI-assisted development
+
+AI tools were used to assist with developing this plugin and its documentation.
+AI-assisted contributions may contain errors and are reviewed and tested as part
+of the project’s normal development process.

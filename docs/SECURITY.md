@@ -18,9 +18,9 @@ Treat the following as private:
 - SSH private keys.
 - Logs containing message text, contact names, media paths, or account details.
 
-The bridge is intended for local use through the SSH tunnel. Do not expose the
-bridge directly to the public internet or bind it to a public interface unless
-you understand the security consequences.
+The bridge rejects non-loopback host bindings. Keep `HOST=127.0.0.1` (the
+default) and connect the Steam Deck through the supported SSH reverse tunnel.
+Direct LAN binding is not supported.
 
 ## Supported versions
 

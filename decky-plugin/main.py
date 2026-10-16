@@ -5,7 +5,6 @@ import binascii
 import subprocess
 import tempfile
 import os
-import traceback
 from pathlib import Path
 
 
@@ -16,48 +15,48 @@ WHISPER_PATH_FILE = VOICE_ROOT / "whisper-cli.path"
 MODEL_PATH_FILE = VOICE_ROOT / "model.path"
 
 
+class VoiceTypingFailure(RuntimeError):
+    """A failure with a fixed, non-sensitive UI/log category."""
+
+    def __init__(self, category: str):
+        self.category = category
+        super().__init__(category)
+
+
 def _read_marker(path_file: Path) -> Path:
     if not path_file.is_file():
-        raise RuntimeError(f"Voice typing marker is missing: {path_file} (home={Path.home()})")
+        raise VoiceTypingFailure("not_configured")
     value = path_file.read_text(encoding="utf-8").strip()
     if not value:
-        raise RuntimeError(f"Voice typing path is empty: {path_file}")
+        raise VoiceTypingFailure("not_configured")
     return Path(value)
 
 
 def _read_executable(path_file: Path) -> Path:
     executable = _read_marker(path_file)
     if not executable.exists():
-        raise RuntimeError(f"Voice typing executable is missing: {executable}")
+        raise VoiceTypingFailure("not_configured")
     if not executable.is_file():
-        raise RuntimeError(f"Voice typing path is not a file: {executable}")
+        raise VoiceTypingFailure("not_configured")
     if not os.access(executable, os.X_OK):
-        raise RuntimeError(f"Voice typing file is not executable: {executable}")
+        raise VoiceTypingFailure("not_configured")
     return executable
 
 
 def _read_data_file(path_file: Path) -> Path:
     data_file = _read_marker(path_file)
     if not data_file.exists():
-        raise RuntimeError(f"Voice typing model is missing: {data_file}")
+        raise VoiceTypingFailure("not_configured")
     if not data_file.is_file():
-        raise RuntimeError(f"Voice typing model path is not a file: {data_file}")
+        raise VoiceTypingFailure("not_configured")
     if not os.access(data_file, os.R_OK):
-        raise RuntimeError(f"Voice typing model is not readable: {data_file}")
+        raise VoiceTypingFailure("not_configured")
     return data_file
-
-
-def _process_output(result: subprocess.CompletedProcess[str]) -> str:
-    lines = []
-    for stream_name, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
-        if stream and stream.strip():
-            lines.append(f"{stream_name}: {stream.strip()}")
-    return "\n".join(lines)[-4000:]
 
 
 def _transcribe(wav_data: bytes) -> str:
     if len(wav_data) > 20 * 1024 * 1024:
-        raise RuntimeError("Recording is too large")
+        raise VoiceTypingFailure("invalid_recording")
 
     whisper = _read_executable(WHISPER_PATH_FILE)
     model = _read_data_file(MODEL_PATH_FILE)
@@ -67,7 +66,7 @@ def _transcribe(wav_data: bytes) -> str:
         audio_path = temp_path / "recording.wav"
         output_base = temp_path / "transcription"
         audio_path.write_bytes(wav_data)
-        print(f"[voice] transcribing {len(wav_data)} bytes with {whisper} and model {model}", flush=True)
+        print(f"[voice] transcribing {len(wav_data)} bytes", flush=True)
 
         # Decky's bundled Python may expose an older temporary libstdc++ from
         # its PyInstaller environment. Whisper.cpp was compiled against the
@@ -94,16 +93,14 @@ def _transcribe(wav_data: bytes) -> str:
             check=False,
         )
         if result.returncode != 0:
-            output = _process_output(result)
-            raise RuntimeError(f"Whisper exited with code {result.returncode}: {output or 'no diagnostic output'}")
+            raise VoiceTypingFailure("transcription_failed")
 
         transcript_path = output_base.with_suffix(".txt")
         if not transcript_path.is_file():
-            output = _process_output(result)
-            raise RuntimeError(f"Whisper produced no transcript at {transcript_path}: {output or 'no diagnostic output'}")
+            raise VoiceTypingFailure("transcription_failed")
         transcript = transcript_path.read_text(encoding="utf-8").lstrip("\ufeff").strip()
         if not transcript:
-            raise RuntimeError("No speech was detected; try speaking closer to the microphone")
+            raise VoiceTypingFailure("no_speech")
         return transcript
 
 
@@ -118,28 +115,30 @@ class Plugin:
     async def voice_typing_status(self):
         """Report whether the optional local Whisper installation is usable."""
         try:
-            whisper = _read_executable(WHISPER_PATH_FILE)
-            model = _read_data_file(MODEL_PATH_FILE)
-            return {"available": True, "executable": str(whisper), "model": str(model)}
-        except Exception as error:
-            return {"available": False, "reason": str(error).strip() or error.__class__.__name__}
+            _read_executable(WHISPER_PATH_FILE)
+            _read_data_file(MODEL_PATH_FILE)
+            return {"available": True}
+        except Exception:
+            return {"available": False, "reason": "not_configured"}
 
     async def transcribe_audio(self, audio_base64: str) -> str:
         try:
             try:
                 wav_data = base64.b64decode(audio_base64, validate=True)
-            except (binascii.Error, ValueError) as error:
-                raise RuntimeError("Invalid voice recording") from error
+            except (binascii.Error, ValueError):
+                raise VoiceTypingFailure("invalid_recording")
 
             if not wav_data.startswith(b"RIFF") or wav_data[8:12] != b"WAVE":
-                raise RuntimeError("Voice recording must be a WAV file")
+                raise VoiceTypingFailure("invalid_recording")
 
             transcript = await asyncio.to_thread(_transcribe, wav_data)
             if not transcript:
-                raise RuntimeError("Whisper returned an empty transcription")
+                raise VoiceTypingFailure("transcription_failed")
             return transcript
-        except Exception as error:
-            details = str(error).strip() or error.__class__.__name__
-            print(f"[voice] transcription failed: {details}", flush=True)
-            traceback.print_exc()
-            return f"__VOICE_ERROR__{details}"
+        except VoiceTypingFailure as error:
+            category = error.category
+            print(f"[voice] transcription failed: {category}", flush=True)
+            return f"__VOICE_ERROR__{category}"
+        except Exception:
+            print("[voice] transcription failed: transcription_failed", flush=True)
+            return "__VOICE_ERROR__transcription_failed"

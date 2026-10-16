@@ -30,8 +30,8 @@ const whatsapp = new WhatsAppService();
 const clients = new Set<WebSocket>();
 let shuttingDown = false;
 
-// HTTP origin checks, preflight handling, and bearer-token authentication.
-app.use(express.json({ limit: "32kb" }));
+// Authenticate and validate origin before reading request bodies. Parser errors
+// are handled below with fixed messages so body contents never reach logs.
 app.use((request, response, next) => {
   const origin = request.header("Origin");
   if (origin && !allowedOrigins.has(origin)) {
@@ -61,16 +61,23 @@ app.use((request, response, next) => {
   next();
 });
 
+app.use(express.json({ limit: "32kb" }));
+
 app.get("/bootstrap", (_request, response) => {
   response.setHeader("Cache-Control", "no-store");
   response.json({ token: bridgeToken });
 });
 
 app.get("/health", (_request, response) => {
-  response.json({ ok: true, status: whatsapp.getStatus(), sessionId });
+  response.json({ ok: true, status: whatsapp.getStatus(), sessionId, processId: process.pid });
 });
 
-app.post("/shutdown", async (_request, response) => {
+app.post("/shutdown", async (request, response) => {
+  const expectedSessionId = request.body?.expectedSessionId;
+  if (expectedSessionId !== undefined && (typeof expectedSessionId !== "string" || expectedSessionId !== sessionId)) {
+    response.status(409).json({ error: "Bridge session changed; refusing shutdown" });
+    return;
+  }
   if (shuttingDown) {
     response.json({ shuttingDown: true });
     return;
@@ -83,7 +90,7 @@ app.post("/shutdown", async (_request, response) => {
     httpServer.close();
     for (const client of clients) client.close();
     clients.clear();
-    const stopPromise = whatsapp.stop().catch((error) => console.error("[bridge] WhatsApp shutdown failed", error));
+    const stopPromise = whatsapp.stop().catch(() => console.error("[bridge] WhatsApp shutdown failed"));
     await Promise.race([
       stopPromise,
       new Promise<void>((resolve) => setTimeout(resolve, 3000))
@@ -105,9 +112,9 @@ app.get("/chats", async (_request, response) => {
     const result = await whatsapp.getRecentChats(limit);
     console.log(`[bridge] returning ${result.chats.length} chats${result.hasMore ? " (more available)" : ""}`);
     response.json(result);
-  } catch (error) {
-    console.error("[bridge] chats request failed", error);
-    response.status(409).json({ error: error instanceof Error ? error.message : "Unable to load chats" });
+  } catch {
+    console.error("[bridge] chats request failed");
+    response.status(409).json({ error: "Unable to load chats" });
   }
 });
 
@@ -120,9 +127,9 @@ app.get("/chats/:chatId/profile", async (request, response) => {
     console.log(`[bridge] profile request for ${request.params.chatId}`);
     const profilePicUrl = await whatsapp.getProfilePicUrl(request.params.chatId);
     response.json({ profilePicUrl: profilePicUrl || null });
-  } catch (error) {
-    console.error(`[bridge] profile request failed for ${request.params.chatId}`, error);
-    response.status(409).json({ error: error instanceof Error ? error.message : "Unable to load profile picture" });
+  } catch {
+    console.error("[bridge] profile request failed");
+    response.status(409).json({ error: "Unable to load profile picture" });
   }
 });
 
@@ -133,8 +140,8 @@ app.get("/chats/:chatId/messages", async (request, response) => {
     const rawLimit = Number(request.query.limit);
     const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 100) : 5;
     response.json(await whatsapp.getChatHistory(request.params.chatId, limit, controller.signal));
-  } catch (error) {
-    if (!response.destroyed) response.status(409).json({ error: error instanceof Error ? error.message : "Unable to load chat history" });
+  } catch {
+    if (!response.destroyed) response.status(409).json({ error: "Unable to load chat history" });
   }
 });
 
@@ -146,9 +153,9 @@ app.post("/chats/:chatId/read", async (request, response) => {
   try {
     const marked = await whatsapp.markChatRead(request.params.chatId);
     response.json({ marked });
-  } catch (error) {
-    console.error(`[bridge] unable to mark chat ${request.params.chatId} as read`, error);
-    response.status(409).json({ error: error instanceof Error ? error.message : "Unable to mark chat as read" });
+  } catch {
+    console.error("[bridge] unable to mark chat as read");
+    response.status(409).json({ error: "Unable to mark chat as read" });
   }
 });
 
@@ -172,9 +179,9 @@ app.post("/messages", async (request, response) => {
     await whatsapp.sendMessage(chatId, body, quotedMessageId as string | undefined);
     console.log("[bridge] message accepted", { chatId, quotedMessageId: quotedMessageId || null });
     response.status(202).json({ accepted: true });
-  } catch (error) {
-    console.error("[bridge] message send failed", error);
-    response.status(409).json({ error: error instanceof Error ? error.message : "Unable to send message" });
+  } catch {
+    console.error("[bridge] message send failed");
+    response.status(409).json({ error: "Unable to send message" });
   }
 });
 
@@ -188,9 +195,9 @@ app.post("/messages/delete", async (request, response) => {
     console.log("[bridge] deleting message", { chatId, messageId });
     await whatsapp.deleteMessage(chatId, messageId);
     response.json({ deleted: true });
-  } catch (error) {
-    console.error("[bridge] message deletion failed", error);
-    response.status(409).json({ error: error instanceof Error ? error.message : "Unable to delete message" });
+  } catch {
+    console.error("[bridge] message deletion failed");
+    response.status(409).json({ error: "Unable to delete message" });
   }
 });
 
@@ -207,16 +214,16 @@ app.post("/reactions", async (request, response) => {
   try {
     await whatsapp.reactToMessage(chatId, messageId, typeof emoji === "string" ? emoji : "❤️");
     response.json({ reacted: typeof emoji !== "string" || emoji.length > 0 });
-  } catch (error) {
-    console.error("[bridge] reaction failed", error);
-    response.status(409).json({ error: error instanceof Error ? error.message : "Unable to react to message" });
+  } catch {
+    console.error("[bridge] reaction failed");
+    response.status(409).json({ error: "Unable to react to message" });
   }
 });
 
 // WebSocket connections and live bridge-event delivery.
 socketServer.on("connection", (socket, request) => {
-  socket.on("error", (error) => {
-    console.warn("[bridge] closing failed event connection", error.message);
+  socket.on("error", () => {
+    console.warn("[bridge] closing failed event connection");
     clients.delete(socket);
     socket.terminate();
   });
@@ -245,21 +252,29 @@ whatsapp.onEvent((event) => {
 httpServer.listen(port, host, () => {
   console.log(`Decky WhatsApp bridge listening on http://${host}:${port}`);
   console.log(`WebSocket events available at ws://${host}:${port}/events`);
-  void whatsapp.start().catch((error: unknown) => {
-    console.error("Unable to start WhatsApp Web; recovery scheduled:", error);
+  void whatsapp.start().catch(() => {
+    console.error("Unable to start WhatsApp Web; recovery scheduled.");
   });
 });
 
 const serverError = (error: NodeJS.ErrnoException) => {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.error(error.code === "EADDRINUSE" ? `Bridge port ${port} is already in use. Close the existing bridge before starting another.` : error);
+  console.error(error.code === "EADDRINUSE"
+    ? `Bridge port ${port} is already in use. Close the existing bridge before starting another.`
+    : "Bridge server failed to start.");
   socketServer.close();
   httpServer.close();
   process.exitCode = 1;
 };
 httpServer.on("error", serverError);
 socketServer.on("error", serverError);
+
+// Parser and otherwise-unhandled request errors must never expose body contents
+// or implementation details to clients or logs.
+app.use((_error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
+  if (!response.headersSent) response.status(400).json({ error: "Invalid request" });
+});
 
 const shutdown = async () => {
   if (shuttingDown) return;

@@ -3,8 +3,12 @@ param(
     [Parameter(Mandatory = $true)] [string]$DeckUser,
     [Parameter(Mandatory = $true)] [string]$DeckHost,
     [Parameter(Mandatory = $true)] [int]$BridgePort,
+    [int]$BridgeProcessId = 0,
+    [long]$BridgeStartTimeUtcTicks = 0,
+    [ValidateRange(1, 300)] [int]$RecoveryDelaySeconds = 60,
     [string]$IdentityFile = "",
     [string]$SshExecutable = "ssh.exe",
+    [switch]$NonInteractive,
     [string]$SshArgumentsOverrideBase64 = "",
     [string]$DiagnosticProbeOverrideBase64 = ""
 )
@@ -20,6 +24,9 @@ $sshArguments = @(
     "-o", "ExitOnForwardFailure=yes",
     "-R", $remoteForward
 )
+
+# Hidden background operation must never block on a password or passphrase prompt.
+if ($NonInteractive) { $sshArguments = @("-o", "BatchMode=yes") + $sshArguments }
 
 if ($IdentityFile) {
     $sshArguments = @("-i", $IdentityFile, "-o", "IdentitiesOnly=yes") + $sshArguments
@@ -57,7 +64,54 @@ function ConvertTo-WindowsArgument([string]$Value) {
     return $builder.ToString()
 }
 
+function Test-BridgeProcess {
+    if ($BridgeProcessId -gt 0) {
+        try {
+            $bridgeProcess = Get-Process -Id $BridgeProcessId -ErrorAction Stop
+            return $BridgeStartTimeUtcTicks -gt 0 -and $bridgeProcess.StartTime.ToUniversalTime().Ticks -eq $BridgeStartTimeUtcTicks
+        } catch { return $false }
+    }
+    return $true
+}
+
+function Capture-BridgeIdentity {
+    # The foreground launcher does not have the bridge PID. Capture the process
+    # that owns the already-listening local bridge socket so recovery can verify
+    # that same process still owns it after waiting for Deck sshd to expire a
+    # dead SSH client.
+    if ($BridgeProcessId -gt 0) { return }
+    try {
+        $processIds = @(Get-ListeningProcessIds)
+        if ($processIds.Count -ne 1 -or [int]$processIds[0] -le 0) { return }
+        $bridgeProcess = Get-Process -Id ([int]$processIds[0]) -ErrorAction Stop
+        $script:BridgeProcessId = $bridgeProcess.Id
+        $script:BridgeStartTimeUtcTicks = $bridgeProcess.StartTime.ToUniversalTime().Ticks
+    } catch { }
+}
+
+function Get-ListeningProcessIds {
+    # netstat works for unprivileged users where Get-NetTCPConnection may deny
+    # access to its system-wide connection table.
+    $portSuffix = ":$BridgePort"
+    $processIds = @()
+    foreach ($line in (& netstat.exe -ano -p tcp 2>$null)) {
+        $columns = @($line -split '\s+' | Where-Object { $_ })
+        if ($columns.Count -lt 5 -or $columns[0] -ne "TCP") { continue }
+        if ($columns[1] -notlike "*$portSuffix" -or $columns[3] -ne "LISTENING") { continue }
+        $processId = 0
+        if ([int]::TryParse($columns[4], [ref]$processId) -and $processId -gt 0) { $processIds += $processId }
+    }
+    return @($processIds | Select-Object -Unique)
+}
+
 function Test-BridgeListening {
+    if (-not (Test-BridgeProcess)) { return $false }
+    if ($BridgeProcessId -gt 0) {
+        try {
+            $processIds = @(Get-ListeningProcessIds)
+            if ($processIds -notcontains $BridgeProcessId) { return $false }
+        } catch { return $false }
+    }
     $client = New-Object System.Net.Sockets.TcpClient
     try {
         $connect = $client.BeginConnect("127.0.0.1", $BridgePort, $null, $null)
@@ -69,6 +123,15 @@ function Test-BridgeListening {
     } finally {
         $client.Close()
     }
+}
+
+function Test-RemoteForwardEstablished([string]$ErrorPath) {
+    try {
+        if (-not (Test-Path -LiteralPath $ErrorPath)) { return $false }
+        $errorText = [System.IO.File]::ReadAllText($ErrorPath)
+        $portPattern = [regex]::Escape([string]$BridgePort)
+        return $errorText -match ("(?im)remote forward success for:\s*listen\s+(?:[^\s,]+:)?$portPattern\b")
+    } catch { return $false }
 }
 
 function Stop-OwnedTunnel([System.Diagnostics.Process]$Process) {
@@ -198,6 +261,12 @@ function Get-RemotePortOwner {
     }
 }
 
+Capture-BridgeIdentity
+$canSafelyRetryStaleForward = $BridgeProcessId -gt 0 -and $BridgeStartTimeUtcTicks -gt 0
+$staleRecoveryAttempted = $false
+$staleRecoveryRetryPending = $false
+$staleRecoveryForwardEstablished = $false
+
 while ($true) {
     if (-not (Test-BridgeListening)) {
         Write-Host "The PC bridge is no longer running. No SSH tunnel was started."
@@ -206,7 +275,14 @@ while ($true) {
 
     $stdoutPath = Join-Path $env:TEMP ("decky-whatsapp-ssh-" + [guid]::NewGuid().ToString("N") + ".out")
     $stderrPath = Join-Path $env:TEMP ("decky-whatsapp-ssh-" + [guid]::NewGuid().ToString("N") + ".err")
-    $arguments = (($sshArguments + $remoteArgument) | ForEach-Object { ConvertTo-WindowsArgument $_ }) -join " "
+    $currentSshArguments = $sshArguments
+    $isStaleRecoveryRetry = $staleRecoveryRetryPending
+    if ($staleRecoveryRetryPending) {
+        # Capture OpenSSH's positive bind confirmation without allowing another prompt.
+        if (-not $SshArgumentsOverrideBase64) { $currentSshArguments = @("-v", "-o", "BatchMode=yes") + $sshArguments }
+        $staleRecoveryRetryPending = $false
+    }
+    $arguments = (($currentSshArguments + $remoteArgument) | ForEach-Object { ConvertTo-WindowsArgument $_ }) -join " "
     $sshProcess = $null
 
     try {
@@ -216,6 +292,10 @@ while ($true) {
         while (-not $sshProcess.HasExited) {
             if (-not (Test-BridgeListening)) {
                 Stop-OwnedTunnel $sshProcess
+                if ($isStaleRecoveryRetry -and -not $staleRecoveryForwardEstablished -and (Test-RemoteForwardEstablished $stderrPath)) {
+                    $staleRecoveryForwardEstablished = $true
+                    Write-Host "OpenSSH confirmed that the remote forward was established. Normal tunnel supervision is active."
+                }
                 exit 0
             }
             Start-Sleep -Milliseconds 500
@@ -226,6 +306,32 @@ while ($true) {
         if (Test-Path -LiteralPath $stdoutPath) { $sshOutput += Get-Content -LiteralPath $stdoutPath }
         if (Test-Path -LiteralPath $stderrPath) { $sshOutput += Get-Content -LiteralPath $stderrPath }
         $sshText = $sshOutput -join [Environment]::NewLine
+
+        # Read the redirected stderr after SSH exits so Windows has released the
+        # file handle. This signal must appear before an exit is reconnectable.
+        if ($isStaleRecoveryRetry -and -not $staleRecoveryForwardEstablished -and (Test-RemoteForwardEstablished $stderrPath)) {
+            $staleRecoveryForwardEstablished = $true
+            Write-Host "OpenSSH confirmed that the remote forward was established. Normal tunnel supervision is active."
+        }
+
+        if ($isStaleRecoveryRetry -and -not $staleRecoveryForwardEstablished) {
+            if ($sshOutput) { $sshOutput | ForEach-Object { Write-Host $_ } }
+            if (-not (Test-BridgeListening)) {
+                Write-Host "The PC bridge is no longer running. Closing after the stale-port retry."
+                exit 0
+            }
+            if ($sshText -match '(?i)(permission denied|authentication failed|no more authentication methods|too many authentication failures|passphrase)') {
+                Write-Host "The one-time stale-port retry could not authenticate without prompting. Password-only SSH or a key that requires an unavailable passphrase cannot recover automatically. Confirm SSH authentication, then manually restart the launcher."
+            } else {
+                Write-Host "The one-time non-interactive stale-port retry ended with SSH exit code $($sshExitCode). The port may still be occupied, or SSH may have a transport, host-key, or other connection error. Review the SSH output, confirm the Deck keepalive setting and connection, then restart the launcher manually."
+            }
+            Write-Host "The launcher is stopping without prompting or retrying again. It will not stop remote processes."
+            exit 1
+        }
+
+        if ($isStaleRecoveryRetry -and $staleRecoveryForwardEstablished) {
+            $sshOutput = @($sshOutput | Where-Object { $_ -notmatch '^\s*debug1:' })
+        }
 
         if ($sshExitCode -ne 0 -and $sshText -match '(?i)(remote port forwarding failed|cannot listen to port|address already in use|administratively prohibited)') {
             if ($sshOutput) { $sshOutput | ForEach-Object { Write-Host $_ } }
@@ -240,10 +346,35 @@ while ($true) {
                     Write-Host "An HTTP service that does not identify as DeckyWhatsapp is responding on remote port $BridgePort."
                 } else {
                     Write-Host "The port may be held by an unresponsive or stale tunnel, a non-HTTP service, or SSH forwarding may be restricted. The owner could not be identified safely."
+                    if (-not $staleRecoveryAttempted -and $canSafelyRetryStaleForward) {
+                        Write-Host "Waiting up to $RecoveryDelaySeconds seconds for the Deck SSH server to expire an unresponsive client. No remote process will be stopped."
+                        $recoveryDeadline = [DateTime]::UtcNow.AddSeconds($RecoveryDelaySeconds)
+                        while ([DateTime]::UtcNow -lt $recoveryDeadline) {
+                            if (-not (Test-BridgeListening)) {
+                                Write-Host "The same local bridge process is no longer listening. Stopping without retrying the remote forward."
+                                exit 0
+                            }
+                            $remainingMilliseconds = [int]($recoveryDeadline - [DateTime]::UtcNow).TotalMilliseconds
+                            if ($remainingMilliseconds -gt 0) { Start-Sleep -Milliseconds ([Math]::Min(250, $remainingMilliseconds)) }
+                        }
+                        if (-not (Test-BridgeListening)) {
+                            Write-Host "The same local bridge process is no longer listening. Stopping without retrying the remote forward."
+                            exit 0
+                        }
+                        $staleRecoveryAttempted = $true
+                        $staleRecoveryRetryPending = $true
+                        Write-Host "The same local bridge process is still active; making one non-interactive SSH forwarding retry."
+                        continue
+                    }
+                    if (-not $canSafelyRetryStaleForward) {
+                        Write-Host "Automatic stale-port recovery is unavailable because this launcher could not verify the local bridge process identity."
+                    } elseif ($staleRecoveryAttempted) {
+                        Write-Host "The single stale-tunnel recovery attempt did not clear the port. Confirm the Deck sshd keepalive setting is active, then stop and restart the launcher."
+                    }
                 }
             }
             Write-Host "This launcher will not stop remote processes. Check the port owner or SSH forwarding policy, then try again."
-            Read-Host "Press Enter to close this window"
+            if (-not $NonInteractive) { Read-Host "Press Enter to close this window" }
             exit 1
         }
 

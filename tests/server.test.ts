@@ -64,6 +64,134 @@ test("health exposes a runtime session ID only after bridge authentication", { t
   assert.notEqual(health.sessionId, token);
 });
 
+test("request parser errors never expose or log private request text", { timeout: 10_000 }, async (t) => {
+  const reservation = createServer();
+  reservation.listen(0, "127.0.0.1");
+  await once(reservation, "listening");
+  const address = reservation.address();
+  assert.ok(address && typeof address !== "string");
+  await new Promise<void>((resolve, reject) => reservation.close((error) => error ? reject(error) : resolve()));
+
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
+    import { WhatsAppService } from './src/whatsapp.ts';
+    WhatsAppService.prototype.start = async () => {};
+    await import('./src/server.ts');
+  `], { env: { ...process.env, PORT: String(address.port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let output = "";
+  let ready!: () => void;
+  const listening = new Promise<void>((resolve) => { ready = resolve; });
+  const append = (chunk: Buffer) => {
+    output += chunk.toString();
+    if (output.includes("bridge listening")) ready();
+  };
+  child.stdout.on("data", append);
+  child.stderr.on("data", append);
+  await listening;
+
+  const url = `http://127.0.0.1:${address.port}`;
+  const bootstrap = await fetch(`${url}/bootstrap`, { headers: { Origin: "https://steamloopback.host" } });
+  const { token } = await bootstrap.json() as { token: string };
+  const privateText = "SYNTHETIC_PRIVATE_REQUEST_BODY_7f1cb";
+  const headers = { Origin: "https://steamloopback.host", "Content-Type": "application/json" };
+  const unauthorized = await fetch(`${url}/messages`, { method: "POST", headers, body: `{"body":"${privateText}"` });
+  assert.equal(unauthorized.status, 401);
+  assert.doesNotMatch(await unauthorized.text(), new RegExp(privateText));
+
+  const malformed = await fetch(`${url}/messages`, {
+    method: "POST",
+    headers: { ...headers, Authorization: `Bearer ${token}` },
+    body: `{"body":"${privateText}"`
+  });
+  assert.equal(malformed.status, 400);
+  assert.deepEqual(await malformed.json(), { error: "Invalid request" });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.doesNotMatch(output, new RegExp(privateText));
+});
+
+test("shutdown requires the expected session ID and refuses a replacement session", { timeout: 10_000 }, async (t) => {
+  const reservation = createServer();
+  reservation.listen(0, "127.0.0.1");
+  await once(reservation, "listening");
+  const address = reservation.address();
+  assert.ok(address && typeof address !== "string");
+  await new Promise<void>((resolve, reject) => reservation.close((error) => error ? reject(error) : resolve()));
+
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
+    import { WhatsAppService } from './src/whatsapp.ts';
+    WhatsAppService.prototype.start = async () => {};
+    await import('./src/server.ts');
+  `], { env: { ...process.env, PORT: String(address.port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let output = "";
+  let ready!: () => void;
+  const listening = new Promise<void>((resolve) => { ready = resolve; });
+  const append = (chunk: Buffer) => {
+    output += chunk.toString();
+    if (output.includes("bridge listening")) ready();
+  };
+  child.stdout.on("data", append);
+  child.stderr.on("data", append);
+  await listening;
+
+  const url = `http://127.0.0.1:${address.port}`;
+  const bootstrap = await fetch(`${url}/bootstrap`, { headers: { Origin: "https://steamloopback.host" } });
+  const { token } = await bootstrap.json() as { token: string };
+  const headers = { Authorization: `Bearer ${token}` };
+  const health = await fetch(`${url}/health`, { headers });
+  const { sessionId } = await health.json() as { sessionId: string };
+
+  const staleStop = await fetch(`${url}/shutdown`, {
+    method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ expectedSessionId: "replacement-session" })
+  });
+  assert.equal(staleStop.status, 409);
+  assert.equal(child.exitCode, null);
+  assert.equal((await fetch(`${url}/health`, { headers })).status, 200);
+
+  const stop = await fetch(`${url}/shutdown`, {
+    method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ expectedSessionId: sessionId })
+  });
+  assert.equal(stop.status, 200);
+  const [exitCode] = await once(child, "close");
+  assert.equal(exitCode, 0);
+});
+
+test("authenticated legacy shutdown without a body remains supported", { timeout: 10_000 }, async (t) => {
+  const reservation = createServer();
+  reservation.listen(0, "127.0.0.1");
+  await once(reservation, "listening");
+  const address = reservation.address();
+  assert.ok(address && typeof address !== "string");
+  await new Promise<void>((resolve, reject) => reservation.close((error) => error ? reject(error) : resolve()));
+
+  const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", `
+    import { WhatsAppService } from './src/whatsapp.ts';
+    WhatsAppService.prototype.start = async () => {};
+    await import('./src/server.ts');
+  `], { env: { ...process.env, PORT: String(address.port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  let output = "";
+  let ready!: () => void;
+  const listening = new Promise<void>((resolve) => { ready = resolve; });
+  const append = (chunk: Buffer) => {
+    output += chunk.toString();
+    if (output.includes("bridge listening")) ready();
+  };
+  child.stdout.on("data", append);
+  child.stderr.on("data", append);
+  await listening;
+
+  const url = `http://127.0.0.1:${address.port}`;
+  const bootstrap = await fetch(`${url}/bootstrap`, { headers: { Origin: "https://steamloopback.host" } });
+  const { token } = await bootstrap.json() as { token: string };
+  const legacyStop = await fetch(`${url}/shutdown`, { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+  assert.equal(legacyStop.status, 200);
+  const [exitCode] = await once(child, "close");
+  assert.equal(exitCode, 0);
+});
+
 test("a second bridge binding fails without replacing the first active session", { timeout: 10_000 }, async (t) => {
   const reservation = createServer();
   reservation.listen(0, "127.0.0.1");

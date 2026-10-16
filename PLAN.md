@@ -1,9 +1,10 @@
 # PLAN.md — DeckyWhatsapp UX Improvement Roadmap
 
-**Status:** APPROVED — Phase 2 and Phase 3 implementation, code review, and required manual Gaming Mode checks are complete per user confirmation on 2026-10-15. Phase 1 retains its previously accepted Task 1.4 deferral; Phase 4 and later have not started.
-**Current task:** Phase 2 and Phase 3 are complete. Phase 4 is the next roadmap phase and awaits user approval before implementation.
+**Status:** APPROVED — Phase 1 is COMPLETE per the user's decision on 2026-10-15; Deck SSH keepalive configuration and physical stale-tunnel recovery verification remain deferred and unchecked. Phases 2, 3, and 4 implementation, code review, and required manual checks are complete per user confirmation. Phase 5 is ON HOLD per the user's decision on 2026-10-15 because no Linux test system is available today. Tasks 5.1–5.4 code work passed review; Linux runtime/manual acceptance, hosted Linux CI, and attachment of the package to a matching published GitHub Release remain pending. Phase 6 is IN PROGRESS.
+**Current task:** Phase 6 — complete the remaining Deck manual checks. The optional Whisper installer fixes passed independent review on pass 1; SteamOS runtime checks remain pending. Phase 5 remains on hold at Task 5.5 until Linux testing can resume.
 **Phase 3 review status:** Tasks 3.1–3.3 passed independent code review. Root tests passed 31/31 with a temporary preload for the Windows Node `os.userInfo()` ENOMEM issue; root typecheck, frontend build/typecheck, and diff check passed on 2026-10-15. The user confirmed all Phase 3 Gaming Mode manual checks passed on 2026-10-15. Phase 2 code review and implementation checks passed; the user also confirmed all Phase 2 Gaming Mode manual checks passed on 2026-10-15.
-**Implementation status:** Phase 1 is complete per the user's confirmation on 2026-10-15. Windows Task 1.4 owner identification passed independent review pass 2. Verified on Windows: `npm.cmd test` (31/31, using a temporary `NODE_OPTIONS` preload for the Node `os.userInfo()` ENOMEM issue), `npm.cmd run typecheck`, `decky-plugin` `npm.cmd run build`, PowerShell parsing, and `git diff --check`. The user marked the applicable Phase 1 manual checks `[x]` and intentionally ignored two checks `[I]`: the password-only SSH second-prompt check and demonstration of safe recovery from a genuinely stale tunnel. Safe stale-tunnel recovery remains unimplemented and its Task 1.4 item stays unchecked; the current diagnostic leaves stale or non-HTTP owners ambiguous. This is an explicit user-accepted Phase 1 deferral, not implemented functionality. Linux launcher parity remains deferred to Phase 5. Phase 2 was approved by the user on 2026-10-15. The focused Task 2.2 fix for retry timeouts after navigation passed independent code review on 2026-10-15, and its frontend build/typecheck passed. The reply-field focus and Steam keyboard activation follow-up passed independent code review on pass 2; its frontend build/typecheck and scoped diff check passed. The user confirmed in Gaming Mode that reply keyboard activation works; all Phase 2 manual checks passed and Phase 2 is complete. The focused retry fix records uncertainty for the mounted plugin session; it is not persisted across plugin remounts. Phase 3 was authorized by the user on 2026-10-15. Task 3.1 notification deduplication passed independent code review and automated frontend checks; its manual Deck checks passed per user confirmation. Phase 3 Tasks 3.1–3.3 passed independent code review and frontend build, typecheck, and diff checks on 2026-10-15. Phase 3 implementation and required Gaming Mode manual checks are complete per user confirmation. Phase 4 and later remain out of scope. Phase 2 verification on Windows: `npm.cmd test` passed 31/31 with the temporary `NODE_OPTIONS` preload for the Node `os.userInfo()` ENOMEM issue; plain `npm.cmd test` fails before tests start with that environment error. `npm.cmd run typecheck`, `decky-plugin` `npm.cmd run build`, frontend `npm.cmd exec -- tsc --noEmit -p tsconfig.json`, and `git diff --check` passed. Task 3.1 verification: frontend build, frontend TypeScript check, and `git diff --check` passed; a reviewer-run mocked callback harness passed notification deduplication, settings/privacy, reconnect/stop/start, and cache-bound checks. Phase 2 and Phase 3 Gaming Mode checks are complete per user confirmation.
+**Implementation status:** Phase 1 is complete per the user's confirmation on 2026-10-15. Windows Task 1.4 owner identification passed independent review pass 2. Verified on Windows: `npm.cmd test` (31/31, using a temporary `NODE_OPTIONS` preload for the Node `os.userInfo()` ENOMEM issue), `npm.cmd run typecheck`, `decky-plugin` `npm.cmd run build`, PowerShell parsing, and `git diff --check`. The user confirmed the applicable Phase 1 manual checks `[x]` and intentionally ignored the password-only SSH second-prompt check `[I]`. The user later considered Phase 1 complete while deferring Deck-side stale-tunnel verification. The Windows bounded-retry implementation passed independent review on pass 3; `npm.cmd test` passed 44/44 with the documented temporary `os.userInfo()` preload, and typecheck, PowerShell parsing, and `git diff --check` passed. The retry checks that the same local bridge remains active, never kills remote processes, and requires OpenSSH debug output confirming the remote forward was established before supervising reconnects. Deck SSH configuration was inspected read-only; effective `ClientAlive` values could not be verified without sudo, and no Deck configuration was changed. The user explicitly deferred configuring and verifying these Deck-side settings while considering Phase 1 complete. The debug success-message format is OpenSSH-version-dependent. Phase 5 Task 5.3 implementation passed independent follow-up review; actual Linux runtime and manual acceptance remain pending. Phase 2 was approved by the user on 2026-10-15. The focused Task 2.2 fix for retry timeouts after navigation passed independent code review on 2026-10-15, and its frontend build/typecheck passed. The reply-field focus and Steam keyboard activation follow-up passed independent code review on pass 2; its frontend build/typecheck and scoped diff check passed. The user confirmed in Gaming Mode that reply keyboard activation works; all Phase 2 manual checks passed and Phase 2 is complete. The focused retry fix records uncertainty for the mounted plugin session; it is not persisted across plugin remounts. Phase 3 was authorized by the user on 2026-10-15. Task 3.1 notification deduplication passed independent code review and automated frontend checks; its manual Deck checks passed per user confirmation. Phase 3 Tasks 3.1–3.3 passed independent code review and frontend build, typecheck, and diff checks on 2026-10-15. Phase 3 implementation and required Gaming Mode manual checks are complete per user confirmation. Phase 4 was approved by the user on 2026-10-15. Task 4.1's initial independent review returned CHANGES_REQUIRED with four findings (replacement-process shutdown safety, QR persistence in logs, port configuration, and supervisor lifetime on port reuse); those were addressed in remediation. Task 4.1 passed independent review on pass 3 on 2026-10-15. The full root suite passed 37/37 using a temporary preload for the Windows Node os.userInfo() ENOMEM issue; npm.cmd run typecheck, PowerShell parsing, and git diff --check passed. Task 4.1 passed independent review on pass 3; all Phase 4 Windows manual checks passed per user confirmation on 2026-10-15. Task 4.2 passed independent review on pass 2 on 2026-10-15. Frontend build, frontend TypeScript check, and diff check passed. Phase 4 is complete per user confirmation of all Windows manual checks on 2026-10-15. Phase 5 was approved by the user on 2026-10-15; Task 5.1 static audit and Task 5.2 installer passed independent review on pass 2; Linux runtime acceptance is pending. Phase 2 verification on Windows: `npm.cmd test` passed 31/31 with the temporary `NODE_OPTIONS` preload for the Node `os.userInfo()` ENOMEM issue; plain `npm.cmd test` fails before tests start with that environment error. `npm.cmd run typecheck`, `decky-plugin` `npm.cmd run build`, frontend `npm.cmd exec -- tsc --noEmit -p tsconfig.json`, and `git diff --check` passed. Task 3.1 verification: frontend build, frontend TypeScript check, and `git diff --check` passed; a reviewer-run mocked callback harness passed notification deduplication, settings/privacy, reconnect/stop/start, and cache-bound checks. Phase 2 and Phase 3 Gaming Mode checks are complete per user confirmation.
+**Phase 5 progress:** Task 5.1 static audit passed independent review on pass 2 on 2026-10-15. Task 5.2 installer code passed independent review on pass 2; Git Bash `bash -n` and trailing-whitespace checks passed. The pinned Puppeteer 24.38.0 bundle supports Linux x86_64; initial support is limited to Ubuntu/Debian x86_64, with ARM excluded until a native browser is validated and Fedora deferred until tested. The dependencies declare Node >=18, but Node 20 is EOL; target supported Node 22/24 LTS and recommend Node 24. Linux install, apt, SSH, browser launch, QR authentication, message exchange, and tunnel behavior remain unverified on this Windows-only host and are reserved for Phase 5 manual verification. The existing `--no-sandbox` flags are retained and recorded as a security limitation pending Linux runtime validation. Task 5.3 initially received CHANGES_REQUIRED after review pass 3. The user authorized continued Phase 5 work on 2026-10-15; both FIFO lifetime and terminal-output findings were fixed and passed independent follow-up review. Linux runtime acceptance remains pending. The launcher resolves its own symlink target before deriving the package root so the Task 5.2 `~/.local/bin/decky-whatsapp` shortcut works. Task 5.4 packaging and documentation passed independent review on pass 2; its ZIP packaging update passed independent review. Both local ZIPs were built reproducibly from explicit allowlists: `releases/decky-whatsapp-pc-windows-v1.0.0.zip` and `releases/decky-whatsapp-pc-linux-v1.0.0.zip`. The actual release attachment and hosted workflow remain unverified. Task 5.5 test-only race synchronization passed independent review on pass 2. The focused tunnel reservation pair passed three consecutive runs and the full Windows suite passed 46/46 with a temporary `NODE_OPTIONS` preload for the Node `os.userInfo()` ENOMEM issue. Root `npm.cmd run typecheck`, `git diff --check`, and Git Bash syntax checks passed. Linux runtime/manual acceptance, hosted workflow execution, and release attachment remain pending while Phase 5 is on hold by user decision.
 **Project:** [db452/DeckyWhatsapp](https://github.com/db452/DeckyWhatsapp)
 
 **Focus:** Steam Deck user experience, reliability, Linux compatibility and ease of use
@@ -32,6 +33,8 @@ Preserve the current architecture consisting of a computer-hosted WhatsApp bridg
 ## 2. Phase 1 — Reliability and immediate UX fixes
 
 **Priority: P0 — Implement first**
+
+**Status: COMPLETE per the user's decision on 2026-10-15.** Deck SSH keepalive configuration and physical stale-tunnel recovery verification remain explicitly deferred and unchecked; completion does not mean those checks passed.
 
 ### Task 1.1 — Fix persistent connection warnings
 
@@ -97,7 +100,7 @@ Preserve the current architecture consisting of a computer-hosted WhatsApp bridg
 
 The existing Windows launcher attempts to clear an occupied remote port. This can potentially interrupt an existing working session.
 
-**Desired behavior:** Only one WhatsApp bridge should actively serve the Deck at a time, unless multi-account support is explicitly introduced in a future release.
+**Desired behavior:** Only one WhatsApp bridge should actively serve the Deck at a time, unless multi-account support is explicitly introduced in a future release. When a prior SSH client disappears uncleanly, Deck `sshd` should expire that dead connection and the Windows launcher should retry binding the port for a bounded period. The launcher must never kill a process based only on its port number.
 
 **Proposed default policy: First connected session wins.**
 
@@ -107,7 +110,7 @@ The existing Windows launcher attempts to clear an occupied remote port. This ca
 - [x] Remove automatic termination of arbitrary processes occupying the Deck's bridge port.
 - [x] Detect a responding DeckyWhatsapp bridge on the occupied remote port without exposing its session ID or token.
 - [x] Distinguish a responding DeckyWhatsapp bridge from another HTTP service where safely possible; leave stale, non-HTTP, and otherwise unidentifiable owners ambiguous.
-- [ ] Recover a verified stale SSH tunnel without terminating unrelated processes. — DEFERRED BY USER; Phase 1 accepted with this item outstanding.
+- [x] Add bounded Windows recovery for an unidentified stale remote-forward conflict, confirming the same local bridge remains active and never terminating a remote process. — INDEPENDENT REVIEW PASS 3 PASSED; 44/44 tests and code-level checks passed.
 - [x] Assign an identifiable runtime session ID to each bridge instance, without exposing authentication secrets.
 - [x] Consider exposing non-sensitive connection identification information through an authenticated health/status endpoint.
 - [x] Display an informative error when a second computer attempts to connect to an already occupied Deck.
@@ -115,7 +118,8 @@ The existing Windows launcher attempts to clear an occupied remote port. This ca
 - [x] Allow an existing bridge to reconnect after temporary network loss, provided it does not displace another active session.
 - [x] Make SSH port-binding failures authoritative, even if a previous port-availability check succeeded.
 - [x] Ensure the existing Windows launcher follows the conflict policy.
-- [ ] Ensure the future Linux launcher follows the same conflict policy (Phase 5 implementation).
+- [ ] Configure Deck `sshd` dead-client expiry (`ClientAliveInterval 15`, `ClientAliveCountMax 3`) and verify the effective settings. — PENDING DECK ADMINISTRATOR ACTION; no privileged configuration has been changed.
+- [x] Ensure the Linux launcher follows the same conflict policy. — IMPLEMENTED AND REVIEWED UNDER TASK 5.3; Linux runtime verification remains pending under Phase 5.
 - [x] Add tests for simultaneous connection attempts and competing reconnection loops.
 
 **Example behavior:**
@@ -138,7 +142,7 @@ Computer A remains connected and unaffected.
 
 - Multiple bridges cannot silently take over each other's connections.
 - Existing working sessions remain uninterrupted.
-- Genuine stale connections can be recovered safely.
+- A genuinely stale SSH forward clears through dead-client expiry and a bounded retry without terminating an unrelated or live owner.
 - No launcher kills arbitrary SSH or unrelated processes.
 - Simultaneous startup races are handled predictably.
 
@@ -152,7 +156,7 @@ The user confirmed the `[x]` checks passed and marked `[I]` checks as intentiona
 - [x] With PC A connected, attempt PC B; verify the owner diagnostic identifies the responding DeckyWhatsapp bridge and PC A can continue sending and receiving.
 - [x] Where a safe test service is available, verify another HTTP service is not labeled DeckyWhatsapp; verify non-HTTP or unresponsive owners receive an ambiguous, non-destructive diagnostic.
 - [I] If using password-only SSH, confirm the diagnostic probe does not prompt for a second password. — INTENTIONALLY IGNORED BY USER; not verified.
-- [I] Demonstrate safe recovery from a genuinely stale tunnel without disturbing a live bridge or unrelated service. — INTENTIONALLY IGNORED BY USER; stale-tunnel recovery remains unimplemented.
+- [ ] Demonstrate safe recovery from a genuinely stale tunnel without disturbing a live bridge or unrelated service. — WINDOWS IMPLEMENTATION AND CODE REVIEW COMPLETE; PENDING DECK SSH CONFIGURATION AND MANUAL VERIFICATION.
 
 ---
 
@@ -283,6 +287,8 @@ Complete these with the plugin running in Gaming Mode in addition to the relevan
 
 **Priority: P2 — Convenience improvement**
 
+**Status: COMPLETE — all Phase 4 Windows manual checks passed per user confirmation on 2026-10-15.**
+
 ### Task 4.1 — Introduce optional background operation
 
 **Current behavior:** The Windows launcher starts the WhatsApp bridge and SSH tunnel in separate windows that must remain open.
@@ -291,15 +297,15 @@ Complete these with the plugin running in Gaming Mode in addition to the relevan
 
 **Implementation:**
 
-- [ ] Preserve the existing launcher as the reliable fallback.
-- [ ] Explore launching the bridge and tunnel without persistent console windows.
-- [ ] Provide a clear way to inspect logs and determine whether each process is running.
-- [ ] Consider a Windows tray application only if it offers meaningful benefits.
-- [ ] Ensure users can stop the system cleanly.
-- [ ] Avoid duplicate bridge processes and conflicting tunnels.
-- [ ] Validate recovery when the Steam Deck reconnects after sleep or its IP address changes.
-- [ ] Ensure background operation only begins after explicit user initiation.
-- [ ] Ensure closing a background application actually terminates its owned processes or clearly distinguishes minimizing from stopping.
+- [x] Preserve the existing launcher as the reliable fallback.
+- [x] Add optional background launch for the bridge and tunnel without persistent console windows.
+- [x] Provide commands to inspect logs and determine whether each process is running.
+- [x] Consider a Windows tray application only if it offers meaningful benefits. — Script commands provide the needed controls without a tray app.
+- [x] Ensure users can stop the system cleanly, including recovery from partial startup.
+- [x] Avoid duplicate bridge processes and conflicting tunnels.
+- [x] Validate recovery when the Steam Deck reconnects after sleep or its IP address changes. — USER CONFIRMED PASSED 2026-10-15
+- [x] Ensure background operation only begins after explicit user initiation.
+- [x] Ensure closing the management command does not silently stop the session; provide a distinct explicit Stop command and explain it in the README.
 
 **Strict requirement: No automatic startup.**
 
@@ -311,12 +317,12 @@ Do not register Windows startup entries, scheduled login tasks, persistent auto-
 
 **Implementation:**
 
-- [ ] Review the distinction between disabling notifications, disconnecting the plugin and shutting down the PC bridge.
-- [ ] Use descriptive button labels.
-- [ ] Avoid accidentally terminating the bridge when the user only intends to close the interface.
-- [ ] Make the current running state obvious.
-- [ ] Ensure the shutdown workflow remains compatible with existing scripts.
-- [ ] Preserve the explicit-startup requirement.
+- [x] Review the distinction between disabling notifications, disconnecting the plugin and shutting down the PC bridge.
+- [x] Use descriptive button labels.
+- [x] Avoid accidentally terminating the bridge when the user only intends to close the interface.
+- [x] Make the current running state obvious.
+- [x] Ensure the shutdown workflow remains compatible with existing scripts.
+- [x] Preserve the explicit-startup requirement.
 
 **Acceptance criteria:** Users understand exactly what Start, Stop and notification controls do.
 
@@ -324,15 +330,17 @@ Do not register Windows startup entries, scheduled login tasks, persistent auto-
 
 Complete these on Windows in addition to the relevant Section 8 checks.
 
-- [ ] Start background operation deliberately, inspect running state and logs, then stop it; verify the bridge and its owned tunnel exit cleanly. — PENDING IMPLEMENTATION + MANUAL REVIEW
-- [ ] Confirm notification disablement, plugin disconnect, and PC bridge shutdown have distinct, accurate effects and labels. — PENDING IMPLEMENTATION + MANUAL REVIEW
-- [ ] Verify reconnect after Deck sleep or IP change, and confirm no bridge or tunnel starts automatically at Windows login. — PENDING IMPLEMENTATION + MANUAL REVIEW
+- [x] Start background operation deliberately, inspect running state and logs (confirm the pairing QR and bridge token are absent), then stop it; verify the bridge and its owned tunnel exit cleanly. — USER CONFIRMED PASSED 2026-10-15
+- [x] Confirm notification disablement, plugin disconnect, and PC bridge shutdown have distinct, accurate effects and labels. — USER CONFIRMED PASSED 2026-10-15
+- [x] Verify reconnect after Deck sleep or IP change, and confirm no bridge or tunnel starts automatically at Windows login. — USER CONFIRMED PASSED 2026-10-15
 
 ---
 
 ## 6. Phase 5 — Linux installer and bridge compatibility
 
 **Priority: P1/P2 — New platform support**
+
+**Status: ON HOLD per the user's decision on 2026-10-15 — no Linux test system is available today. Resume at Task 5.5 runtime and manual verification.**
 
 ### Objective
 
@@ -343,6 +351,7 @@ The Steam Deck will continue running the same Decky plugin. The main difference 
 **Initial platform targets:**
 
 - Ubuntu and Debian-based Linux distributions.
+- x86_64 architecture for the initial support target; the pinned Puppeteer 24.38.0 browser bundle does not establish Linux ARM support.
 - Other common distributions, such as Fedora, after dependency and installation testing.
 
 **Important:** Running the bridge directly on SteamOS is not part of this phase. The existing Steam Deck Whisper installer remains separate.
@@ -351,15 +360,17 @@ The Steam Deck will continue running the same Decky plugin. The main difference 
 
 **Implementation:**
 
-- [ ] Identify Windows-specific assumptions in the existing bridge and launcher.
-- [ ] Verify Node.js 20+ compatibility on Linux.
-- [ ] Confirm the pinned `whatsapp-web.js` dependency and Puppeteer can run on supported Linux environments.
-- [ ] Identify required Chromium system libraries.
-- [ ] Review browser executable discovery and sandbox settings.
-- [ ] Ensure configuration, logs and authentication paths work correctly on Linux.
-- [ ] Avoid changing the existing Windows implementation unnecessarily.
+- [x] Identify Windows-specific assumptions in the existing bridge and launcher.
+- [x] Check the pinned dependency Node.js engine ranges and select a currently supported LTS target (Node 22/24; recommend 24 for new installations). — Linux runtime compatibility still requires manual verification.
+- [x] Confirm the pinned `whatsapp-web.js` dependency and Puppeteer's official Linux target: Ubuntu/Debian x86_64 initially; exclude ARM pending a validated native browser, and defer Fedora until tested.
+- [x] Identify required Chromium system libraries and note distribution-specific package-name differences.
+- [x] Review browser executable discovery and sandbox settings. — Puppeteer uses its bundled Chrome for Testing by default; the existing bridge disables Chromium sandboxing.
+- [x] Identify configuration, log and authentication path behavior. — `.env`, LocalAuth and the WhatsApp cache depend on the process working directory; Linux launchers must start from the package directory.
+- [x] Avoid changing the existing Windows implementation unnecessarily.
 
 **Acceptance criteria:** The existing WhatsApp bridge can start, authenticate and exchange messages on a supported Linux computer.
+
+**Runtime acceptance:** PENDING — no Linux host is available in this Windows environment. Verify clean installation, browser launch, QR authentication, persistent session and message exchange during Phase 5 manual testing.
 
 ### Task 5.2 — Create a Linux installation script
 
@@ -367,17 +378,19 @@ The Steam Deck will continue running the same Decky plugin. The main difference 
 
 **Implementation:**
 
-- [ ] Detect the Linux distribution and architecture.
-- [ ] Check for Node.js, npm, Git and OpenSSH client availability.
-- [ ] Check for necessary Chromium/Puppeteer system dependencies.
-- [ ] Provide installation guidance for missing requirements.
-- [ ] Offer supported dependency installation where appropriate.
-- [ ] Install Node.js dependencies using the project's lockfile.
-- [ ] Check SSH connectivity to the Steam Deck.
-- [ ] Offer explicit setup of passwordless SSH authentication.
-- [ ] Create convenient launcher shortcuts where supported.
-- [ ] Preserve existing WhatsApp authentication data during reinstallation.
-- [ ] Display understandable installation errors and recovery steps.
+- [x] Detect the Linux distribution and architecture (Ubuntu/Debian x86_64 initial target).
+- [x] Check for Node.js 22+, npm, Git and OpenSSH client availability; recommend Node 24 LTS.
+- [x] Check for necessary Chromium/Puppeteer system dependencies, including apt package alternatives.
+- [x] Provide installation guidance for missing requirements.
+- [x] Offer apt dependency installation only after explicit consent, with a separate confirmation for the resolved package list.
+- [x] Install Node.js dependencies using the project's lockfile with `npm ci`.
+- [x] Check SSH connectivity to the Steam Deck.
+- [x] Offer explicit setup of passwordless SSH authentication without replacing existing keys.
+- [x] Create a user-level launcher shortcut where supported, without overwriting an existing command.
+- [x] Preserve existing WhatsApp authentication data, configuration, cache and SSH keys during reinstallation.
+- [x] Display understandable installation errors and recovery steps.
+
+**Implementation review:** Passed independent review on pass 2 on 2026-10-15. Git Bash `bash -n` and trailing-whitespace checks passed. The installer was not executed; Linux package installation, SSH, browser launch and persistent data checks remain pending manual verification.
 
 **Security and installation requirements:**
 
@@ -400,38 +413,45 @@ The Steam Deck will continue running the same Decky plugin. The main difference 
 
 **Implementation:**
 
-- [ ] Start the WhatsApp bridge using the installed Node.js environment.
-- [ ] Locate the Steam Deck by hostname or IP address.
-- [ ] Allow manually entering the Deck's address when automatic discovery fails.
-- [ ] Establish the existing SSH reverse tunnel.
-- [ ] Keep the bridge bound to the local loopback interface.
-- [ ] Detect SSH forwarding failures.
-- [ ] Recover from temporary network interruptions.
-- [ ] Respect the single-active-bridge policy from Task 1.4.
-- [ ] Stop the launcher-owned bridge and tunnel cleanly.
-- [ ] Preserve explicit manual startup.
-- [ ] Support ordinary terminal execution first; optionally offer a manually launched background mode.
+- [x] Start the WhatsApp bridge using the installed Node.js environment.
+- [x] Locate the Steam Deck by hostname or IP address.
+- [x] Allow manually entering the Deck's address when automatic discovery fails.
+- [x] Establish the existing SSH reverse tunnel.
+- [x] Keep the bridge bound to the local loopback interface.
+- [x] Detect SSH forwarding failures.
+- [x] Recover from temporary network interruptions.
+- [x] Respect the single-active-bridge policy from Task 1.4.
+- [x] Stop the launcher-owned bridge and tunnel cleanly.
+- [x] Preserve explicit manual startup.
+- [x] Support ordinary terminal execution first; optionally offer a manually launched background mode.
 
 **Acceptance criteria:** A Linux computer can provide the same core messaging functionality as the Windows companion application.
+
+**Implementation review:** Initial review returned CHANGES_REQUIRED on pass 3 on 2026-10-15 for FIFO lifetime and terminal-output backpressure. After the user authorized continuation, both findings were resolved and passed an independent follow-up review. Git Bash `bash -n`, focused Linux SSH tests (2/2, using the temporary Windows `os.userInfo()` preload), `npm.cmd run typecheck`, and `git diff --check` passed. No Linux runtime test was run; password prompting, tunnel establishment, reconnection, bridge ownership, messaging, and shutdown remain pending manual verification.
+
+**GitHub issue tracking:** Opened [#3 — Avoid SSH FIFO startup race](https://github.com/db452/DeckyWhatsapp/issues/3) and [#4 — Keep SSH log draining independent of terminal output](https://github.com/db452/DeckyWhatsapp/issues/4) on 2026-10-15. GitHub CLI authentication succeeded outside the network sandbox.
+
+**Local checks:** Git Bash `bash -n` passed for both scripts; trailing-whitespace scan passed; `npm.cmd run typecheck` passed. Plain `npm.cmd test` failed before tests started because this Windows Node environment returned `uv_os_get_passwd` ENOMEM. Re-running with the temporary `NODE_OPTIONS` compatibility preload passed 37/37. These checks do not establish Linux runtime behavior.
 
 ### Task 5.4 — Update release packaging and documentation
 
 **Implementation:**
 
-- [ ] Create a Linux companion package in GitHub Releases.
-- [ ] Include the Linux installer and launcher.
-- [ ] Keep Windows and Linux releases distinguishable.
-- [ ] Update README compatibility requirements.
-- [ ] Document Linux-specific installation and troubleshooting.
-- [ ] Document supported Linux distributions and architectures.
-- [ ] Include guidance on Chromium installation problems.
-- [ ] Ensure no private session data or local tokens enter release archives.
-- [ ] Add automated Linux installation/build checks where practical.
+- [ ] Create and verify a Linux companion package asset in GitHub Releases. — The local platform ZIPs exist. The workflow attaches them to a matching user-published release. The current latest release is v1.0.0, which predates these uncommitted Phase 5 changes; do not attach these builds to that tag. Publish from a matching future version after the Phase 5 changes are included in its source.
+- [x] Create distinct Windows and Linux companion ZIPs under local `releases/` with the files required for each platform. — Independently reviewed; both archives match explicit allowlists and retain Linux executable modes.
+- [x] Include the Linux installer and launcher.
+- [x] Keep Windows and Linux releases distinguishable.
+- [x] Update README compatibility requirements.
+- [x] Document Linux-specific installation and troubleshooting.
+- [x] Document supported Linux distributions and architectures.
+- [x] Include guidance on Chromium installation problems.
+- [x] Ensure no private session data or local tokens enter release archives. — Verified by independent archive inspection and explicit allowlist checks.
+- [x] Add automated Linux installation/build checks where practical. — Workflow is configured; hosted execution remains pending.
 
 **Proposed artifacts:**
 
 - `decky-whatsapp-pc-windows-*.zip`
-- `decky-whatsapp-pc-linux-*.tar.gz`
+- `decky-whatsapp-pc-linux-*.zip`
 - `decky-whatsapp-decky-plugin-*.zip`
 
 These filenames are proposals and should be reconciled with the existing release workflow.
@@ -454,18 +474,20 @@ These filenames are proposals and should be reconciled with the existing release
 
 ### Manual completion checks — Phase 5
 
-Complete these on at least one supported Linux distribution and on Windows for parity, in addition to the relevant Section 8 checks.
+Complete these on at least one supported Linux distribution and on Windows for parity, in addition to the relevant Section 8 checks. **PENDING; Phase 5 is on hold until a Linux test system is available.**
 
-- [ ] Install and launch on a supported Linux desktop; verify missing-dependency guidance, SSH setup, and deliberate startup work without unnecessary privilege escalation. — PENDING IMPLEMENTATION + MANUAL REVIEW
-- [ ] Complete WhatsApp QR authentication, send and receive text/media, and verify notifications and session persistence after a deliberate restart. — PENDING IMPLEMENTATION + MANUAL REVIEW
-- [ ] Interrupt and restore the network; verify the tunnel recovers and a competing Windows or Linux bridge cannot displace the active session. — PENDING IMPLEMENTATION + MANUAL REVIEW
-- [ ] Repeat installation and confirm configuration, WhatsApp authentication data, and existing SSH keys are preserved; verify neither OS starts the bridge automatically. — PENDING IMPLEMENTATION + MANUAL REVIEW
+- [ ] Install and launch on a supported Linux desktop; verify missing-dependency guidance, SSH setup, and deliberate startup work without unnecessary privilege escalation. — PENDING MANUAL REVIEW; no supported Linux host is available in this Windows session.
+- [ ] Complete WhatsApp QR authentication, send and receive text/media, and verify notifications and session persistence after a deliberate restart. — PENDING MANUAL REVIEW; Linux runtime has not been exercised.
+- [ ] Interrupt and restore the network; verify the tunnel recovers and a competing Windows or Linux bridge cannot displace the active session. — PENDING MANUAL REVIEW; Linux tunnel runtime has not been exercised.
+- [ ] Repeat installation and confirm configuration, WhatsApp authentication data, and existing SSH keys are preserved; verify neither OS starts the bridge automatically. — PENDING MANUAL REVIEW on Linux and Windows.
 
 ---
 
 ## 7. Phase 6 — Maintainability and regression protection
 
 **Priority: P2 — After core UX improvements**
+
+**Status: IN PROGRESS per user approval on 2026-10-15. Tasks 6.1 and 6.2 code work passed independent review. Task 6.3 passed independent review on pass 3 on 2026-10-16 after two remediation rounds. The optional Whisper installer fixes passed independent review on pass 1; Git Bash syntax and scoped diff checks passed. Steam Deck manual checks, representative runtime-log inspection, voice-typing runtime validation, and the physical session-persistence check remain pending. Hosted Linux CI and Chromium sandbox validation remain pending under the Phase 5 hold.**
 
 ### Task 6.1 — Gradually modularize the frontend
 
@@ -485,12 +507,14 @@ These paths are suggestions, not mandatory requirements.
 
 **Implementation:**
 
-- [ ] Extract small, isolated UI components first.
-- [ ] Extract pure formatting and state helpers.
-- [ ] Reuse common message and chat types where practical.
-- [ ] Avoid introducing unnecessary state-management libraries.
-- [ ] Preserve existing behavior throughout the refactor.
-- [ ] Keep architecture changes separate from user-facing feature changes.
+- [x] Extract small, isolated UI components first. — `ContactAvatar` is extracted and used by contacts and the conversation header; independent review passed on pass 1.
+- [x] Extract pure formatting and state helpers. — Avatar initials and deterministic style helpers moved to `utils/avatar.ts`; independent review passed on pass 1.
+- [x] Reuse common message and chat types where practical. — `ChatSummary` is shared from `types/chat.ts`; independent review passed on pass 1.
+- [x] Avoid introducing unnecessary state-management libraries. — No dependencies or state-management libraries added.
+- [ ] Preserve existing behavior throughout the refactor. — ContactAvatar and MessageBubble layout, labels, and parent event ownership passed independent code review; physical Deck visual/interaction verification remains pending below.
+- [x] Keep architecture changes separate from user-facing feature changes. — This slice changes component/module boundaries only.
+
+**Implementation progress:** ContactAvatar and MessageBubble presentation slices passed independent review (one pass each). `npm.cmd run build`, `npm.cmd exec -- tsc --noEmit -p tsconfig.json`, and `git diff --check` passed. Deck visual and interaction review remains pending.
 
 **Acceptance criteria:** The codebase becomes easier to maintain without changing observable behavior.
 
@@ -498,35 +522,41 @@ These paths are suggestions, not mandatory requirements.
 
 **Implementation:**
 
-- [ ] Test connection failure and recovery states.
-- [ ] Test timestamp formatting.
-- [ ] Test message sending states.
-- [ ] Test notification deduplication.
-- [ ] Test controller navigation where practical.
-- [ ] Test multiple competing bridges and session ownership.
-- [ ] Test SSH port conflicts and launcher recovery behavior.
-- [ ] Include Linux compatibility checks in CI where practical.
-- [ ] Extend the existing test infrastructure rather than replacing it unnecessarily.
+- [x] Test connection failure and recovery states. — Existing connection and connection-state tests passed in the 50/50 full suite.
+- [x] Test timestamp formatting. — Existing formatter tests passed in the 50/50 full suite.
+- [x] Test message sending states. — Added coverage for sent, delivered, read, sending, failed, and uncertain states; independently reviewed.
+- [x] Test notification deduplication. — Added coverage for duplicate IDs and bounded oldest-entry eviction; independently reviewed.
+- [ ] Test controller navigation where practical. — No isolated unit-test seam without Decky focus/controller runtime; retain the manual Deck checks below.
+- [x] Test multiple competing bridges and session ownership. — Existing server/tunnel tests passed in the 50/50 full suite.
+- [x] Test SSH port conflicts and launcher recovery behavior. — Existing tunnel recovery/conflict tests passed in the 50/50 full suite.
+- [x] Include Linux compatibility checks in CI where practical. — Ubuntu workflow runs tests, typecheck, and shell/package checks; hosted execution remains pending under Phase 5.
+- [x] Extend the existing test infrastructure rather than replacing it unnecessarily. — Extended the existing Node `node:test` suite without adding dependencies.
+
+**Implementation review:** Passed independent review on pass 1. Focused helper tests passed 4/4; the full suite passed 50/50 for Task 6.2 and later 53/53 including Task 6.3 regressions, using a temporary `os.userInfo()` preload for the known Windows Node `uv_os_get_passwd` ENOMEM issue. Root typecheck, frontend build/typecheck, and scoped `git diff --check` passed. Plain `npm.cmd test` remains unable to start in this Windows environment without the documented preload. Controller navigation remains a manual Deck check.
 
 **Acceptance criteria:** Previously fixed bugs have regression coverage, particularly GitHub issues #1 and #2.
 
 ### Task 6.3 — Review security without disrupting UX
 
-- [ ] Check whether Chromium's `--no-sandbox` flags are necessary on each supported operating system.
-- [ ] Preserve loopback-only bridge binding.
-- [ ] Review bridge authentication boundaries.
-- [ ] Ensure diagnostic logs do not inadvertently expose sensitive message content or tokens.
-- [ ] Preserve local WhatsApp authentication files and existing sessions.
-- [ ] Avoid unnecessary dependency upgrades during UX work.
-- [ ] Ensure multiple-bridge detection does not expose credentials or session tokens.
+- [ ] Check whether Chromium's `--no-sandbox` flags are necessary on each supported operating system. — Linux runtime is unavailable while Phase 5 is on hold; do not claim the flags are necessary or remove them without runtime validation.
+- [x] Preserve loopback-only bridge binding. — Explicit host allowlist rejects non-loopback values; `.env.example` and `docs/SECURITY.md` now document the enforced loopback binding and supported SSH tunnel.
+- [x] Review bridge authentication boundaries. — Static review confirms origin checks, per-process bearer-token HTTP auth, WebSocket token checks, and expected-session shutdown validation.
+- [x] Ensure diagnostic logs do not inadvertently expose sensitive message content or tokens. — Remediated malformed-body, WebSocket event, Whisper output, and WhatsApp dependency-exception logging. Synthetic redaction regressions and corrected Python CI test discovery passed; independent review passed on pass 3. Representative runtime-log inspection remains pending below.
+- [x] Preserve local WhatsApp authentication files and existing sessions. — Static installer/shutdown review found no session deletion; physical reinstall/restart check remains pending below.
+- [x] Avoid unnecessary dependency upgrades during UX work. — Dependency versions and lockfiles are unchanged.
+- [x] Ensure multiple-bridge detection does not expose credentials or session tokens. — Static review confirms probes use bounded unauthenticated health fingerprints and do not bootstrap tokens.
 
 ### Manual completion checks — Phase 6
 
 Complete these after maintainability and regression-protection changes, in addition to the relevant Section 8 checks.
 
-- [ ] Run the core Deck workflow after refactoring: open contacts and conversations, send/reply, react, play voice messages, and return to the game. — PENDING IMPLEMENTATION + MANUAL REVIEW
-- [ ] Verify connection recovery, notification behavior, and competing-bridge protection still match the pre-refactor behavior. — PENDING IMPLEMENTATION + MANUAL REVIEW
-- [ ] Inspect representative diagnostics and logs to confirm they contain no message contents, bridge tokens, or WhatsApp authentication data. — PENDING IMPLEMENTATION + MANUAL REVIEW
+- [ ] Run the core Deck workflow after refactoring: open contacts and conversations, send/reply, react, play voice messages, and return to the game. — PENDING MANUAL REVIEW
+- [ ] Verify connection recovery, notification behavior, and competing-bridge protection still match the pre-refactor behavior. — PENDING MANUAL REVIEW
+- [ ] Inspect representative diagnostics and logs to confirm they contain no message contents, bridge tokens, or WhatsApp authentication data. — PENDING MANUAL REVIEW; automated synthetic checks passed, but runtime logs have not been inspected on the Deck.
+- [ ] Verify voice typing returns a successful transcript and that a controlled transcription failure exposes no dictated content in the UI or logs. — PENDING MANUAL REVIEW; automated sentinel coverage passed and installer code review passed, but SteamOS installation and transcription have not been tested.
+- [ ] Restart or reinstall the plugin deliberately and confirm the linked WhatsApp authentication session is preserved. — PENDING MANUAL REVIEW; only static preservation checks have been completed.
+
+**Optional Whisper installer review — PASS on review pass 1 (2026-10-16):** The installer now explicitly repairs missing header packages, restores SteamOS read-only mode after package preparation and returns failure if restoration fails, stages and validates a pinned source checkout, verifies existing and downloaded models against a pinned digest, and rejects root execution. `bash -n` and scoped `git diff --check` passed. The installer was not run; package installation, recovery behavior, and transcription remain pending Steam Deck manual verification.
 
 ---
 

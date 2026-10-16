@@ -3,10 +3,36 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { test } from "node:test";
 import { setImmediate } from "node:timers/promises";
+import qrcodeTerminal from "qrcode-terminal";
 import { WhatsAppService } from "./whatsapp.js";
 
 const require = createRequire(import.meta.url);
 const Message = require("whatsapp-web.js/src/structures/Message.js");
+
+test("background QR pairing keeps the plugin QR event but suppresses terminal credentials", async () => {
+  const previousMode = process.env.DECKY_WHATSAPP_BACKGROUND;
+  const originalGenerate = qrcodeTerminal.generate;
+  let terminalQrCalls = 0;
+  const service = new WhatsAppService();
+  const qrEvent = new Promise<unknown>((resolve) => service.onEvent((event) => {
+    if (event.type === "qr") resolve(event);
+  }));
+  const client = (service as unknown as { client: { emit: (event: string, value: string) => void } }).client;
+  try {
+    process.env.DECKY_WHATSAPP_BACKGROUND = "1";
+    qrcodeTerminal.generate = (() => { terminalQrCalls += 1; }) as typeof qrcodeTerminal.generate;
+    client.emit("qr", "test-pairing-data");
+    const event = await qrEvent as { type: string; dataUrl?: string };
+    await setImmediate();
+    assert.equal(terminalQrCalls, 0);
+    assert.equal(event.type, "qr");
+    assert.match(event.dataUrl ?? "", /^data:image\/png;base64,/);
+  } finally {
+    qrcodeTerminal.generate = originalGenerate;
+    if (previousMode === undefined) delete process.env.DECKY_WHATSAPP_BACKGROUND;
+    else process.env.DECKY_WHATSAPP_BACKGROUND = previousMode;
+  }
+});
 
 function createService() {
   const service = Object.create(WhatsAppService.prototype) as any;
@@ -205,4 +231,54 @@ test("fresh reaction lookup clears a reaction removed on another device", async 
   const result = await service.getChatHistory("chat");
   assert.equal(result.messages[0].reaction, undefined);
   assert.equal(service.reactionCache.has("message"), false);
+});
+
+test("media download failures do not log exception messages, URLs, or tokens", async () => {
+  const service = createService();
+  const sentinel = "PRIVATE_SENTINEL https://example.invalid/media?token=secret-value";
+  const originalError = console.error;
+  const captured: unknown[][] = [];
+  console.error = (...args: unknown[]) => { captured.push(args); };
+  try {
+    const result = await service.downloadMedia({
+      id: "media-1",
+      from: "chat-1",
+      fromMe: false,
+      timestamp: 1,
+      type: "image",
+      hasMedia: true,
+      downloadMedia: async () => { throw new Error(sentinel); }
+    });
+    assert.equal(result, undefined);
+  } finally {
+    console.error = originalError;
+  }
+  assert.ok(captured.length > 0, "the failure should retain a fixed diagnostic");
+  assert.ok(!JSON.stringify(captured).includes(sentinel));
+  assert.ok(!JSON.stringify(captured).includes("secret-value"));
+});
+
+test("chat service failures retain fallback behavior without logging exception content", async () => {
+  const service = createService();
+  const sentinel = "PRIVATE_SENTINEL https://example.invalid/api?token=secret-value";
+  service.status = "ready";
+  service.recentMessages = [];
+  service.client = { getChats: async () => { throw new Error(sentinel); } };
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+  const captured: unknown[][] = [];
+  console.log = (...args: unknown[]) => { captured.push(args); };
+  console.warn = (...args: unknown[]) => { captured.push(args); };
+  console.error = (...args: unknown[]) => { captured.push(args); };
+  try {
+    assert.deepEqual(await service.getRecentChats(), { chats: [], hasMore: false });
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+    console.error = originalError;
+  }
+  assert.ok(captured.some((args) => args.includes("[chats] unable to load recent WhatsApp chats")));
+  assert.ok(!JSON.stringify(captured).includes(sentinel));
+  assert.ok(!JSON.stringify(captured).includes("secret-value"));
 });

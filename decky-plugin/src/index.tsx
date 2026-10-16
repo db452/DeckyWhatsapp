@@ -3,51 +3,19 @@ import { call, definePlugin, toaster } from "@decky/api";
 import { ButtonItem, Focusable, PanelSection, PanelSectionRow, Router, TextField } from "@decky/ui";
 import { FaArrowLeft, FaClock, FaCog, FaFilter, FaMicrophone, FaPaperPlane, FaReply, FaSortAlphaDown, FaStop, FaUsers, FaWhatsapp } from "react-icons/fa";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties } from "react";
 import { connectSocket, createQueuedRequest, fetchWithTimeout } from "./connection";
 import { getConnectionHeadline, getConnectionWarning } from "./connection-state";
 import { formatChatTimestamp } from "./format";
+import { getMessageStatus } from "./message-status";
+import { createNotificationIdCache } from "./notification-id-cache";
+import { ContactAvatar } from "./components/ContactAvatar";
+import { MessageBubble } from "./components/MessageBubble";
+import type { ChatSummary } from "./types/chat";
+import type { IncomingMessage } from "./types/message";
 
 type BridgeStatus = "starting" | "qr_required" | "authenticated" | "ready" | "disconnected" | "auth_failure" | "disabled" | "unknown";
 type SocketState = "connected" | "connecting" | "disconnected" | "disabled" | "unknown";
 type ContactsState = "idle" | "loading" | "loaded" | "failed";
-
-type IncomingMessage = {
-  id: string;
-  chatId: string;
-  chatName: string;
-  sender: string;
-  body: string;
-  timestamp: number;
-  fromMe: boolean;
-  ack?: number;
-  deliveryUncertain?: boolean;
-  mediaLoadState?: "loading" | "unavailable";
-  quotedMessageId?: string;
-  mediaKind?: "image" | "sticker" | "gif" | "audio";
-  reaction?: string;
-  reactions?: string[];
-  image?: {
-    dataUrl: string;
-    filename?: string;
-  };
-  media?: {
-    dataUrl: string;
-    filename?: string;
-    kind: "image" | "sticker" | "gif" | "audio";
-    mimetype: string;
-  };
-};
-
-type ChatSummary = {
-  chatId: string;
-  chatName: string;
-  profilePicUrl?: string;
-  receivedSinceSession?: boolean;
-  lastMessage: string;
-  timestamp: number;
-  unreadCount: number;
-};
 
 type BridgeEvent =
   | { type: "status"; status: BridgeStatus }
@@ -94,30 +62,6 @@ const contactModeDescriptions: Record<ContactMode, string> = {
   sinceSession: "Only show people who have messaged since this plugin session began."
 };
 
-function initials(name: string): string {
-  const words = name.trim().split(/\s+/).filter(Boolean);
-  if (words.length > 1) return `${words[0][0]}${words[1][0]}`.toUpperCase();
-  return name.trim().slice(0, 2).toUpperCase() || "?";
-}
-
-function avatarStyle(name: string): CSSProperties {
-  const colors = ["#2f6f67", "#76558f", "#8a5c38", "#35658a", "#806b32"];
-  const index = [...name].reduce((sum, character) => sum + character.charCodeAt(0), 0) % colors.length;
-  return {
-    width: "42px",
-    height: "42px",
-    borderRadius: "50%",
-    background: colors[index],
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    flexShrink: 0,
-    fontWeight: 700,
-    fontSize: "14px",
-    letterSpacing: "0.5px"
-  };
-}
-
 function inputValue(value: unknown): string {
   if (typeof value === "string") return value;
   if (typeof value === "object" && value !== null) {
@@ -125,23 +69,6 @@ function inputValue(value: unknown): string {
     if (typeof event.target?.value === "string") return event.target.value;
   }
   return "";
-}
-
-function errorMessage(value: unknown): string {
-  if (value instanceof Error) return value.message || String(value);
-  if (typeof value === "string") return value;
-  if (typeof value === "object" && value !== null) {
-    const candidate = value as { message?: unknown; error?: unknown; detail?: unknown };
-    for (const item of [candidate.message, candidate.error, candidate.detail]) {
-      if (typeof item === "string" && item.trim()) return item;
-    }
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return String(value);
-    }
-  }
-  return String(value);
 }
 
 function uniqueReactions(reactions: string[] | undefined): string[] | undefined {
@@ -158,15 +85,6 @@ function uniqueReactions(reactions: string[] | undefined): string[] | undefined 
 
 function formatDiagnosticTime(value?: number): string {
   return value ? new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "Never";
-}
-
-function messageStatus(ack?: number, deliveryUncertain = false): { symbol: string; color: string; label: string } {
-  if (deliveryUncertain) return { symbol: "?", color: "#ffbd75", label: "Delivery uncertain" };
-  if (ack === -1) return { symbol: "!", color: "#ff8d8d", label: "Failed" };
-  if (ack === 0) return { symbol: "…", color: "rgba(255,255,255,0.55)", label: "Sending" };
-  if (ack !== undefined && ack >= 3) return { symbol: "✓✓", color: "#63b9ff", label: "Read" };
-  if (ack !== undefined && ack >= 2) return { symbol: "✓✓", color: "rgba(255,255,255,0.65)", label: "Delivered" };
-  return { symbol: "✓", color: "rgba(255,255,255,0.65)", label: "Sent" };
 }
 
 function hasMediaFallbackBody(body: string): boolean {
@@ -237,17 +155,7 @@ async function bridgeFetch(input: RequestInfo | URL, init: RequestInit = {}, ret
 
 let backgroundNotifications: ReturnType<typeof connectSocket> | undefined;
 // Keep recent IDs across socket reconnects; cap this module-lifetime cache at 500.
-const recentNotifiedMessageIds = new Set<string>();
-const maxRememberedNotificationIds = 500;
-
-function rememberNotifiedMessage(messageId: string): void {
-  recentNotifiedMessageIds.add(messageId);
-  while (recentNotifiedMessageIds.size > maxRememberedNotificationIds) {
-    const oldestMessageId = recentNotifiedMessageIds.values().next().value;
-    if (oldestMessageId === undefined) break;
-    recentNotifiedMessageIds.delete(oldestMessageId);
-  }
-}
+const recentNotifiedMessageIds = createNotificationIdCache(500);
 
 function stopBackgroundNotifications(): void {
   backgroundNotifications?.close();
@@ -264,7 +172,7 @@ function startBackgroundNotifications(): void {
   backgroundNotifications = connectSocket({
     url: () => bridgeWebSocketUrl(defaultBridgeUrl),
     onClose: resetBridgeToken,
-    onError: (error) => console.warn("[decky-whatsapp] notification connection failed; retrying", error),
+    onError: () => console.warn("[decky-whatsapp] notification connection failed; retrying"),
     onMessage: (data) => {
       try {
         const message = JSON.parse(data) as BridgeEvent;
@@ -282,9 +190,9 @@ function startBackgroundNotifications(): void {
           showNewIndicator: true
         });
         // Record only after toast succeeds so a failed notification can be retried.
-        rememberNotifiedMessage(messageId);
-      } catch (error) {
-        console.warn("[decky-whatsapp] background notification event failed", error);
+        recentNotifiedMessageIds.remember(messageId);
+      } catch {
+        console.warn("[decky-whatsapp] background notification event failed");
       }
     }
   });
@@ -381,6 +289,7 @@ function WhatsAppPanel() {
   const [showSettings, setShowSettings] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [shuttingDown, setShuttingDown] = useState(false);
+  const [confirmBridgeShutdown, setConfirmBridgeShutdown] = useState<{ bridgeUrl: string; sessionId: string } | null>(null);
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => window.localStorage.getItem("decky-whatsapp-notifications-enabled") !== "false");
   const [notificationSoundEnabled, setNotificationSoundEnabled] = useState(() => window.localStorage.getItem("decky-whatsapp-notification-sound") !== "false");
   const [notificationPreviewsEnabled, setNotificationPreviewsEnabled] = useState(() => window.localStorage.getItem("decky-whatsapp-notification-previews") !== "false");
@@ -466,6 +375,10 @@ function WhatsAppPanel() {
   const activeConnectionWarning = getConnectionWarning(enabled, httpState, socketState, status);
 
   useEffect(() => {
+    setConfirmBridgeShutdown(null);
+  }, [bridgeSessionId, normalizedBridgeUrl, enabled, showSettings, showDiagnostics]);
+
+  useEffect(() => {
     window.localStorage.setItem("decky-whatsapp-contact-mode", contactMode);
   }, [contactMode]);
 
@@ -501,7 +414,9 @@ function WhatsAppPanel() {
       .then((result) => {
         if (cancelled) return;
         setVoiceTypingAvailable(result.available);
-        setVoiceTypingReason(result.reason || "");
+        setVoiceTypingReason(result.reason === "not_configured"
+          ? "Install the optional Deck-local Whisper engine first"
+          : result.reason ? "Voice typing is unavailable" : "");
       })
       .catch(() => {
         // Older installations may not have the optional status method yet.
@@ -595,7 +510,7 @@ function WhatsAppPanel() {
         }
       } catch (loadError) {
         if (cancelled) return;
-        console.error("[decky-whatsapp] contacts request failed", loadError);
+        console.error("[decky-whatsapp] contacts request failed");
         setContactsState("failed");
       }
     });
@@ -833,9 +748,12 @@ function WhatsAppPanel() {
     return () => window.cancelAnimationFrame(frame);
   }, [selectedChatId, showSettings, showDiagnostics]);
 
-  const toggleEnabled = async () => {
+  const toggleEnabled = () => {
     if (enabled) {
-      await shutdownAll();
+      window.localStorage.setItem("decky-whatsapp-enabled", "false");
+      setEnabled(false);
+      stopBackgroundNotifications();
+      closeConversation();
       return;
     }
     window.localStorage.setItem("decky-whatsapp-enabled", "true");
@@ -850,23 +768,29 @@ function WhatsAppPanel() {
     setConnectionRefresh((current) => current + 1);
   };
 
-  const shutdownAll = async () => {
-    if (shuttingDown) return;
-    window.localStorage.setItem("decky-whatsapp-enabled", "false");
-    setEnabled(false);
-    stopBackgroundNotifications();
-    closeConversation();
+  const shutdownBridge = async (confirmation: { bridgeUrl: string; sessionId: string } | null) => {
+    if (
+      shuttingDown || !confirmation || !enabled || !showSettings || showDiagnostics ||
+      httpState !== "connected" || !bridgeSessionId ||
+      confirmation.bridgeUrl !== normalizedBridgeUrl || confirmation.sessionId !== bridgeSessionId
+    ) return;
     setShuttingDown(true);
     try {
-      const response = await bridgeFetch(`${normalizedBridgeUrl}/shutdown`, { method: "POST" });
+      const response = await bridgeFetch(`${confirmation.bridgeUrl}/shutdown`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedSessionId: confirmation.sessionId })
+      });
       if (!response.ok) throw new Error(`shutdown failed (${response.status})`);
-      toaster.toast({ title: "Decky WhatsApp", body: "Bridge and SSH tunnel shutting down", duration: 4000 });
-    } catch {
-      toaster.toast({ title: "Decky WhatsApp", body: "Could not reach the PC bridge", duration: 5000 });
-    } finally {
       window.localStorage.setItem("decky-whatsapp-enabled", "false");
       setEnabled(false);
-      setShowSettings(false);
+      stopBackgroundNotifications();
+      closeConversation();
+      setConfirmBridgeShutdown(null);
+      toaster.toast({ title: "Decky WhatsApp", body: "PC bridge shutting down", duration: 4000 });
+    } catch {
+      toaster.toast({ title: "Decky WhatsApp", body: "Could not confirm or shut down the PC bridge", duration: 5000 });
+    } finally {
       setShuttingDown(false);
     }
   };
@@ -972,9 +896,9 @@ function WhatsAppPanel() {
             setChats((current) => current.map((item) => item.chatId === chat.chatId ? { ...item, unreadCount: 0 } : item));
           }
         })
-        .catch((error) => console.warn("[decky-whatsapp] could not mark conversation as read", { chatId: chat.chatId, error }));
-    } catch (selectionError) {
-      if (conversationRun.current === run && panelMounted.current) reportError(selectionError instanceof Error ? selectionError.message : "Unable to load conversation history");
+        .catch(() => console.warn("[decky-whatsapp] could not mark conversation as read"));
+    } catch {
+      if (conversationRun.current === run && panelMounted.current) reportError("Unable to load conversation history");
     } finally {
       if (conversationRun.current === run && panelMounted.current) setHistoryLoading(false);
     }
@@ -1067,8 +991,8 @@ function WhatsAppPanel() {
         const uncertain = !receivedHttpResponse;
         const message = uncertain
           ? "No send confirmation received. Delivery is uncertain; check WhatsApp before retrying."
-          : sendError instanceof Error ? sendError.message : "Message could not be sent";
-        console.error("[decky-whatsapp] send failed", sendError);
+          : "Message could not be sent";
+        console.error("[decky-whatsapp] send failed");
         if (!stillActive()) return;
         reportError(message);
         setHistory((current) => [...current, {
@@ -1207,10 +1131,9 @@ function WhatsAppPanel() {
         const reactions = emoji ? [...otherReactions, emoji] : otherReactions;
         return { ...message, reaction: emoji || undefined, reactions: uniqueReactions(reactions) };
       }));
-    } catch (reactionError) {
-      const message = reactionError instanceof Error ? reactionError.message : "Reaction could not be sent";
-      console.error("[decky-whatsapp] reaction failed", reactionError);
-      reportError(message);
+    } catch {
+      console.error("[decky-whatsapp] reaction failed");
+      reportError("Reaction could not be sent");
     }
   };
 
@@ -1255,12 +1178,18 @@ function WhatsAppPanel() {
         const transcript = await call<[string], string>("transcribe_audio", arrayBufferToBase64(wav));
         if (!stillActive()) return;
         if (transcript.startsWith("__VOICE_ERROR__")) {
-          const details = transcript.slice("__VOICE_ERROR__".length);
-          if (/marker|not installed|executable|model is missing|path is empty/i.test(details)) {
+          const category = transcript.slice("__VOICE_ERROR__".length);
+          if (category === "not_configured") {
             setVoiceTypingAvailable(false);
-            setVoiceTypingReason(details);
+            setVoiceTypingReason("Install the optional Deck-local Whisper engine first");
           }
-          throw new Error(details);
+          const messages: Record<string, string> = {
+            invalid_recording: "The recording could not be processed",
+            not_configured: "Voice typing is not configured",
+            no_speech: "No speech was detected. Try speaking closer to the microphone",
+            transcription_failed: "Transcription failed. Check the Whisper installation and try again"
+          };
+          throw new Error(messages[category] || "Transcription failed");
         }
         if (!transcript?.trim()) throw new Error("Whisper returned no text");
         setReply((current) => current ? `${current} ${transcript.trim()}` : transcript.trim());
@@ -1268,7 +1197,9 @@ function WhatsAppPanel() {
         toaster.toast({ title: "Voice typing", body: "Text added to your reply", duration: 3000 });
       } catch (voiceError) {
         if (!stillActive()) return;
-        const message = errorMessage(voiceError);
+        const message = voiceError instanceof Error && voiceError.message === "No audio was captured from the microphone"
+          ? voiceError.message
+          : "Transcription failed. Please try again";
         reportError(message);
         toaster.toast({ title: "Voice typing failed", body: message, duration: 6000 });
       } finally {
@@ -1300,22 +1231,14 @@ function WhatsAppPanel() {
       voiceSession.current = { context, stream, source, processor, chunks, sampleRate: context.sampleRate };
       setVoiceState("recording");
       toaster.toast({ title: "Voice typing", body: "Recording… press the microphone again to stop", duration: 3000 });
-    } catch (voiceError) {
+    } catch {
       stream?.getTracks().forEach((track) => track.stop());
       void context?.close().catch(() => undefined);
-      if (stillActive()) reportError(voiceError instanceof Error ? voiceError.message : "Microphone access failed");
+      if (stillActive()) reportError("Microphone access failed");
     } finally {
       voiceStarting.current = false;
     }
   };
-
-  const renderAvatar = (chat: ChatSummary, size = 42) => chat.profilePicUrl ? (
-    <img src={chat.profilePicUrl} alt="" style={{ width: `${size}px`, height: `${size}px`, borderRadius: "50%", objectFit: "cover", flexShrink: 0 }} />
-  ) : (
-    <div aria-label="Generic profile picture" style={{ ...avatarStyle(chat.chatName), width: `${size}px`, height: `${size}px` }}>
-      {initials(chat.chatName)}
-    </div>
-  );
 
   const renderMedia = (message: IncomingMessage) => {
     const knownMediaLabel = message.mediaKind === "audio" ? "Voice message"
@@ -1346,12 +1269,12 @@ function WhatsAppPanel() {
       const playAudio = () => {
         const audio = audioRefs.current[message.id];
         if (!audio) return;
-        void audio.play().catch((playError) => {
-          console.error("[decky-whatsapp] voice playback failed", { messageId: message.id, error: playError });
+        void audio.play().catch(() => {
+          console.error("[decky-whatsapp] voice playback failed");
           toaster.toast({ title: "Voice message", body: "Decky could not play this audio", duration: 5000 });
         });
       };
-      return <div style={{ marginTop: "8px", minHeight: "112px" }}><div style={{ fontSize: "12px", opacity: 0.7, marginBottom: "4px" }}>Voice message · select it and press Y</div><audio ref={(element) => { audioRefs.current[message.id] = element; }} src={media.dataUrl} aria-label="WhatsApp voice message" preload="auto" controls onError={() => { markMediaUnavailable(message.id); console.error("[decky-whatsapp] voice media element error", { messageId: message.id, mimetype: media.mimetype }); }} style={{ width: "100%" }} /><button type="button" onClick={(event) => { event.stopPropagation(); playAudio(); }} style={{ marginTop: "6px", padding: "6px 10px", borderRadius: "6px", border: "0", color: "white", background: "rgba(99, 210, 173, 0.35)" }}>▶ Play voice message</button></div>;
+      return <div style={{ marginTop: "8px", minHeight: "112px" }}><div style={{ fontSize: "12px", opacity: 0.7, marginBottom: "4px" }}>Voice message · select it and press Y</div><audio ref={(element) => { audioRefs.current[message.id] = element; }} src={media.dataUrl} aria-label="WhatsApp voice message" preload="auto" controls onError={() => { markMediaUnavailable(message.id); console.error("[decky-whatsapp] voice media element error"); }} style={{ width: "100%" }} /><button type="button" onClick={(event) => { event.stopPropagation(); playAudio(); }} style={{ marginTop: "6px", padding: "6px 10px", borderRadius: "6px", border: "0", color: "white", background: "rgba(99, 210, 173, 0.35)" }}>▶ Play voice message</button></div>;
     }
     if (media.kind === "gif" || media.mimetype.startsWith("video/")) {
       return <div style={{ marginTop: "8px", height: "180px" }}><div style={{ fontSize: "12px", opacity: 0.7, marginBottom: "4px" }}>GIF</div><video src={media.dataUrl} aria-label={media.filename || "WhatsApp GIF"} autoPlay loop muted playsInline controls onError={() => markMediaUnavailable(message.id)} style={{ display: "block", width: "100%", height: "156px", objectFit: "contain", borderRadius: "10px" }} /></div>;
@@ -1366,7 +1289,8 @@ function WhatsAppPanel() {
     <>
       <PanelSection title="WhatsApp">
         <PanelSectionRow><div style={{ display: "flex", alignItems: "center", gap: "8px", opacity: 0.8 }}><span style={{ width: "8px", height: "8px", borderRadius: "50%", background: getConnectionHeadline(enabled, httpState, socketState, status) === "Connected" ? "#63d297" : "#d49b57" }} /> {getConnectionHeadline(enabled, httpState, socketState, status)}</div></PanelSectionRow>
-        <PanelSectionRow><ButtonItem layout="below" onClick={() => void toggleEnabled()}>{enabled ? "Stop Decky WhatsApp" : "Start Decky WhatsApp"}</ButtonItem></PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" onClick={() => toggleEnabled()}>{enabled ? "Disconnect this plugin" : "Connect to PC bridge"}</ButtonItem></PanelSectionRow>
+        <PanelSectionRow><div style={{ opacity: 0.65, fontSize: "12px" }}>This controls the Decky connection only. Disconnecting leaves the PC bridge running.</div></PanelSectionRow>
         {activeConnectionWarning && <PanelSectionRow><div style={{ color: "#ffbd75", fontSize: "13px" }}>{activeConnectionWarning}</div></PanelSectionRow>}
         {error && <PanelSectionRow><div style={{ color: "#ff8d8d", fontSize: "13px" }}>{error}</div></PanelSectionRow>}
       </PanelSection>
@@ -1385,7 +1309,7 @@ function WhatsAppPanel() {
               <div data-decky-chat-id={chat.chatId}>
               <ButtonItem layout="below" onClick={() => void selectChat(chat)}>
                 <div style={{ display: "flex", alignItems: "center", gap: "12px", minWidth: 0 }}>
-                  {renderAvatar(chat)}
+                  <ContactAvatar chat={chat} />
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0 }}><strong title={chat.chatName} style={{ display: "block", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{chat.chatName}</strong>{chat.unreadCount > 0 && <span aria-label={`${chat.unreadCount} unread ${chat.unreadCount === 1 ? "message" : "messages"}`} title={`${chat.unreadCount} unread ${chat.unreadCount === 1 ? "message" : "messages"}`} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0, minWidth: "22px", height: "22px", padding: "0 6px", color: "#09251d", background: "#70e0b8", border: "1px solid #a2f4d7", borderRadius: "999px", fontSize: "11px", fontWeight: 800, lineHeight: 1 }}>{chat.unreadCount > 99 ? "99+" : chat.unreadCount}</span>}</div>
                     <div style={{ opacity: 0.62, fontSize: "13px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: "3px" }}>{chat.lastMessage || "No recent message"}</div>
@@ -1403,7 +1327,7 @@ function WhatsAppPanel() {
         <PanelSection title="Settings">
           <PanelSectionRow><div style={{ opacity: 0.7, fontSize: "13px", padding: "4px 0 8px" }}>Choose how your WhatsApp contacts are arranged.</div></PanelSectionRow>
           <PanelSectionRow><div style={{ opacity: 0.7, fontSize: "13px", padding: "8px 0 2px" }}>Notifications</div></PanelSectionRow>
-          <PanelSectionRow><ButtonItem layout="below" onClick={() => setNotificationsEnabled((current) => !current)}><div style={{ textAlign: "left" }}><strong>{notificationsEnabled ? "✓ " : ""}Show notifications</strong><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Show a Decky notification when a new WhatsApp message arrives.</div></div></ButtonItem></PanelSectionRow>
+          <PanelSectionRow><ButtonItem layout="below" onClick={() => setNotificationsEnabled((current) => !current)}><div style={{ textAlign: "left" }}><strong>{notificationsEnabled ? "✓ " : ""}Decky message notifications</strong><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Show or suppress Decky notifications only. This does not disconnect the plugin or stop the PC bridge.</div></div></ButtonItem></PanelSectionRow>
           <PanelSectionRow><ButtonItem layout="below" onClick={() => setNotificationSoundEnabled((current) => !current)}><div style={{ textAlign: "left" }}><strong>{notificationSoundEnabled ? "✓ " : ""}Play notification sounds</strong><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Play a sound with new message notifications.</div></div></ButtonItem></PanelSectionRow>
           <PanelSectionRow><ButtonItem layout="below" onClick={() => setNotificationPreviewsEnabled((current) => !current)}><div style={{ textAlign: "left" }}><strong>{notificationPreviewsEnabled ? "✓ " : ""}Show message previews</strong><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Include the contact name and message text in notifications.</div></div></ButtonItem></PanelSectionRow>
           <PanelSectionRow><ButtonItem layout="below" onClick={() => setNotificationsWhileGaming((current) => !current)}><div style={{ textAlign: "left" }}><strong>{notificationsWhileGaming ? "✓ " : ""}Notify while gaming</strong><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Keep message notifications active after leaving this plugin.</div></div></ButtonItem></PanelSectionRow>
@@ -1421,6 +1345,19 @@ function WhatsAppPanel() {
           ))}
           <PanelSectionRow><ButtonItem layout="below" onClick={() => setCompactHistory((current) => !current)}><div style={{ display: "flex", alignItems: "center", gap: "12px", textAlign: "left" }}><FaClock /><div><div><strong>{compactHistory ? "✓ " : ""}Show only the last 5 messages</strong></div><div style={{ opacity: 0.6, fontSize: "12px", marginTop: "3px" }}>Keep conversations compact and load older messages on demand.</div></div></div></ButtonItem></PanelSectionRow>
           <PanelSectionRow><ButtonItem layout="below" onClick={() => setShowDiagnostics(true)}><span style={{ display: "flex", alignItems: "center", gap: "10px" }}>Diagnostics</span></ButtonItem></PanelSectionRow>
+          <PanelSectionRow><div style={{ opacity: 0.7, fontSize: "13px", padding: "8px 0 2px" }}>PC bridge</div></PanelSectionRow>
+          <PanelSectionRow><div style={{ opacity: 0.65, fontSize: "12px" }}>Shutting down the PC bridge stops it for every connected Deck. Closing this panel or disconnecting this plugin does not stop it.</div></PanelSectionRow>
+          {!confirmBridgeShutdown ? (
+            <PanelSectionRow><ButtonItem layout="below" disabled={shuttingDown || !enabled || httpState !== "connected" || !bridgeSessionId} onClick={() => setConfirmBridgeShutdown({ bridgeUrl: normalizedBridgeUrl, sessionId: bridgeSessionId })}>Shut down PC bridge</ButtonItem></PanelSectionRow>
+          ) : (
+            <PanelSectionRow><div style={{ width: "100%" }}>
+              <div style={{ color: "#ffbd75", fontSize: "13px", padding: "4px 0 8px" }}>Confirm shutdown? This stops the PC bridge for all Deck clients.</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                <ButtonItem layout="below" disabled={shuttingDown || !enabled || httpState !== "connected" || !bridgeSessionId || confirmBridgeShutdown.bridgeUrl !== normalizedBridgeUrl || confirmBridgeShutdown.sessionId !== bridgeSessionId} onClick={() => void shutdownBridge(confirmBridgeShutdown)}>{shuttingDown ? "Shutting down…" : "Confirm: shut down PC bridge"}</ButtonItem>
+                <ButtonItem layout="below" disabled={shuttingDown} onClick={() => setConfirmBridgeShutdown(null)}>Cancel</ButtonItem>
+              </div>
+            </div></PanelSectionRow>
+          )}
           <PanelSectionRow><ButtonItem layout="below" onClick={() => setShowSettings(false)}><span style={{ display: "flex", alignItems: "center", gap: "10px" }}><FaArrowLeft /> Back to contacts</span></ButtonItem></PanelSectionRow>
         </PanelSection>
       )}
@@ -1448,7 +1385,7 @@ function WhatsAppPanel() {
           closeConversation();
         }}>
         <PanelSection title="Conversation">
-          <PanelSectionRow><div style={{ display: "flex", alignItems: "center", gap: "12px", padding: "2px 0 8px" }}>{selectedChat && renderAvatar(selectedChat, 38)}<div style={{ minWidth: 0 }}><strong style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{selectedChat?.chatName || "Conversation"}</strong><span style={{ opacity: 0.6, fontSize: "12px" }}>{history.length} messages</span></div></div></PanelSectionRow>
+          <PanelSectionRow><div style={{ display: "flex", alignItems: "center", gap: "12px", padding: "2px 0 8px" }}>{selectedChat && <ContactAvatar chat={selectedChat} size={38} />}<div style={{ minWidth: 0 }}><strong style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{selectedChat?.chatName || "Conversation"}</strong><span style={{ opacity: 0.6, fontSize: "12px" }}>{history.length} messages</span></div></div></PanelSectionRow>
           <PanelSectionRow><div style={{ opacity: 0.65, fontSize: "12px" }}>A: open/select · B: back · D-pad: navigate · Select a message for actions · X: react · Y: play/pause voice · Steam+X: keyboard</div></PanelSectionRow>
           <PanelSectionRow><ButtonItem layout="below" onClick={closeConversation}><span style={{ display: "flex", alignItems: "center", gap: "10px" }}><FaArrowLeft /> Back to contacts</span></ButtonItem></PanelSectionRow>
           {historyLoading && <PanelSectionRow><div style={{ opacity: 0.7 }}>{historyExpanded ? "Loading older messages…" : "Loading conversation…"}</div></PanelSectionRow>}
@@ -1459,21 +1396,15 @@ function WhatsAppPanel() {
             <PanelSectionRow>
               <div data-decky-message-id={message.id} tabIndex={0} onFocusCapture={() => setFocusedMessageId(message.id)} onKeyDown={(event) => { if (event.key.toLowerCase() !== "y" || message.media?.kind !== "audio") return; event.preventDefault(); const audio = audioRefs.current[message.id]; if (!audio) return; if (audio.paused) void audio.play(); else audio.pause(); }} style={{ width: "100%" }}>
                 <ButtonItem layout="below" onClick={() => { setFocusedMessageId(message.id); setSelectedMessageId(message.id); }}>
-                  <div style={{ display: "flex", justifyContent: message.fromMe ? "flex-end" : "flex-start", width: "100%" }}>
-                    <div style={{ position: "relative", maxWidth: "88%", padding: "10px 12px", borderRadius: message.fromMe ? "14px 14px 4px 14px" : "14px 14px 14px 4px", background: message.fromMe ? "rgba(55, 128, 108, 0.5)" : "rgba(255,255,255,0.11)", border: selectedMessageId === message.id ? "2px solid rgba(126, 211, 181, 0.9)" : "2px solid transparent", textAlign: "left" }}>
-                      {(() => {
-                        const reactions = uniqueReactions(message.reactions && message.reactions.length > 0 ? message.reactions : message.reaction ? [message.reaction] : undefined);
-                        return reactions && <span aria-label="Message reactions" style={{ position: "absolute", top: "-10px", right: "-8px", borderRadius: "14px", minWidth: "28px", minHeight: "28px", padding: "0 5px", display: "flex", alignItems: "center", justifyContent: "center", gap: "2px", background: "#4b2732", fontSize: "16px" }}>{reactions.join(" ")}</span>;
-                      })()}
-                      <div style={{ fontSize: "12px", opacity: 0.68, marginBottom: message.body ? "3px" : 0 }}>{message.fromMe ? "You" : message.sender}</div>
-                      {message.body && <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.3 }}>{message.body}</div>}
-                      {renderMedia(message)}
-                      <div style={{ fontSize: "10px", opacity: 0.58, marginTop: "6px", textAlign: "right" }}>
-                        {new Date(message.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                        {message.fromMe && <span title={messageStatus(message.ack, message.deliveryUncertain).label} aria-label={messageStatus(message.ack, message.deliveryUncertain).label} style={{ marginLeft: "5px", color: messageStatus(message.ack, message.deliveryUncertain).color, fontWeight: 700 }}>{messageStatus(message.ack, message.deliveryUncertain).symbol}</span>}
-                      </div>
-                    </div>
-                  </div>
+                  <MessageBubble
+                    message={message}
+                    selected={selectedMessageId === message.id}
+                    reactions={uniqueReactions(message.reactions && message.reactions.length > 0 ? message.reactions : message.reaction ? [message.reaction] : undefined)}
+                    status={message.fromMe ? getMessageStatus(message.ack, message.deliveryUncertain) : undefined}
+                    timestamp={new Date(message.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  >
+                    {renderMedia(message)}
+                  </MessageBubble>
                 </ButtonItem>
               </div>
             </PanelSectionRow>
