@@ -40,9 +40,33 @@ archive.
    ./start-decky-whatsapp-linux.sh
    ```
 
-   Keep the terminal open and press Ctrl+C to stop the launcher's bridge and
-   its own tunnel. The launcher may ask for the Deck hostname or IP. It does
-   not install a system service, login autostart, or scheduled task.
+   Keep this one terminal open and press Ctrl+C to stop the launcher's bridge
+   and its own tunnel. The installer checks only `steamdeck.local`,
+   `steamdeck.lan`, and `steamdeck` through the operating system's hostname
+   resolver, then suggests the first resolvable hostname for you to confirm or
+   replace. This bounded lookup is not LAN discovery and does not contact SSH
+   or authenticate. If no candidate resolves, enter a hostname or IP manually.
+   The installer saves the Deck hostname or IP you enter
+   for later launches in `~/.config/decky-whatsapp/deck-host` (or the matching
+   directory under `XDG_CONFIG_HOME`). The launcher does not open a second
+   terminal window and does not install a system service, login autostart, or
+   scheduled task.
+
+   To change the saved address, run:
+
+   ```sh
+   ./start-decky-whatsapp-linux.sh --configure-deck-host
+   ```
+
+   This prompts with the saved address as its default and exits after saving;
+   it does not start the bridge or SSH tunnel. You can supply a replacement
+   directly with `./start-decky-whatsapp-linux.sh --configure-deck-host HOST`.
+
+   For a one-time address override, use
+   `./start-decky-whatsapp-linux.sh --deck-host HOST` or set
+   `DECK_HOST=HOST` for that launch. `--help` lists the launcher options.
+   Both launchers accept DNS hostnames and IPv4 addresses. Enter the host only,
+   without a port or SSH option; IPv6 literals are not supported by the launchers.
 5. On the first bridge start, scan the WhatsApp QR code if requested. WhatsApp
    authentication data is stored locally in `.wwebjs_auth/`; keep it private
    and back it up only through a secure method. `.env` is optional local
@@ -72,8 +96,18 @@ this is a known security limitation pending Linux runtime validation.
 ## SSH and tunnel troubleshooting
 
 - Ensure OpenSSH client is installed and SSH is enabled on the Deck.
-- The default host is `steamdeck.lan`; if it does not resolve, enter the Deck's
-  current hostname or IP when prompted.
+- The installer saves the hostname or IP entered during installation. The
+  launcher reuses it without prompting on later starts. If no address has been
+  saved and no explicit override is supplied, it checks only
+  `steamdeck.local`, `steamdeck.lan`, and `steamdeck` through the operating
+  system's hostname resolver, then asks you to confirm or replace the first
+  resolvable hostname. This bounded lookup does not scan the LAN, connect to
+  SSH, or authenticate. If none resolve, enter a hostname or IP manually.
+- The launcher prints that bridge and tunnel run in the same terminal. It
+  reports when the SSH process has launched; that message alone does not prove
+  authentication or remote-forward establishment. OpenSSH may prompt for the
+  Deck password in this terminal. If SSH exits, the launcher reports the
+  observed failure category and does not terminate remote processes.
 - The main SSH connection reads interactive prompts from `/dev/tty`, so it can
   ask for a password in the terminal. The launcher captures raw SSH stderr in
   a private temporary file rather than mirroring it live. After exit, it

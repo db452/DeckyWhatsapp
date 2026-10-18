@@ -20,6 +20,9 @@ COMMON_FILES = (
     "README.md",
     "package.json",
     "package-lock.json",
+    "scripts/deck-host-prompt.ps1",
+    "scripts/read-bridge-port.mjs",
+    "scripts/suggest-deck-host.mjs",
     "src/server.ts",
     "src/types.ts",
     "src/whatsapp.ts",
@@ -46,6 +49,7 @@ PLATFORMS = {
             "install-decky-whatsapp-linux.sh",
             "start-decky-whatsapp-linux.sh",
             "keep-ssh-tunnel.sh",
+            "scripts/launcher-validation.sh",
         ),
         "executables": {
             "install-decky-whatsapp-linux.sh",

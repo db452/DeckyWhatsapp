@@ -2,6 +2,23 @@
 export type BridgeHttpState = "connected" | "connecting" | "disconnected" | "disabled" | "unknown";
 export type BridgeSocketState = "connected" | "connecting" | "disconnected" | "disabled" | "unknown";
 export type WhatsAppState = "starting" | "qr_required" | "authenticated" | "ready" | "disconnected" | "auth_failure" | "disabled" | "unknown";
+export function getConnectionToggleLabel(enabled: boolean): "Start" | "Stop this Deck" {
+  return enabled ? "Stop this Deck" : "Start";
+}
+
+export function createPluginConnectionSession() {
+  let enabled = false;
+  return {
+    isEnabled: () => enabled,
+    setEnabled: (next: boolean) => { enabled = next; }
+  };
+}
+
+export function runResumeRecovery(enabled: boolean, recover: () => void): boolean {
+  if (!enabled) return false;
+  recover();
+  return true;
+}
 
 export function getConnectionHeadline(enabled: boolean, http: BridgeHttpState, socket: BridgeSocketState, whatsapp: WhatsAppState): string {
   if (!enabled) return "Disabled";

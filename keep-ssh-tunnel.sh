@@ -23,11 +23,13 @@ fail() {
 [[ -t 0 && -t 1 ]] || fail "Run this supervisor from an interactive terminal."
 [[ -n "${PROJECT_ROOT}" && -d "${PROJECT_ROOT}" ]] || fail "Project root was not supplied or does not exist."
 PROJECT_ROOT="$(cd -P -- "${PROJECT_ROOT}" && pwd)"
+source "${PROJECT_ROOT}/scripts/launcher-validation.sh"
 [[ -f "${PROJECT_ROOT}/package.json" && -f "${PROJECT_ROOT}/package-lock.json" ]] || fail "Could not find the project manifests under ${PROJECT_ROOT}."
-[[ "${BRIDGE_PORT}" =~ ^[0-9]+$ ]] && (( BRIDGE_PORT >= 1 && BRIDGE_PORT <= 65535 )) || fail "Bridge port must be an integer from 1 to 65535."
-[[ "${DECK_HOST}" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*$ ]] || fail "Invalid Steam Deck hostname/address."
+BRIDGE_PORT="$(normalize_port "${BRIDGE_PORT}")" || fail "Bridge port must be a decimal integer from 1 to 65535."
+valid_deck_host "${DECK_HOST}" || fail "Invalid Steam Deck hostname/address. Use a DNS hostname or IPv4 address without spaces, ports, or SSH options."
 command -v node >/dev/null 2>&1 || fail "Node.js is unavailable."
 command -v ssh >/dev/null 2>&1 || fail "OpenSSH client is unavailable."
+node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' || fail "Node.js 22 or newer is required; found $(node --version)."
 command -v timeout >/dev/null 2>&1 || fail "The coreutils timeout command is unavailable; it is required to bound the read-only SSH owner probe."
 [[ -x "${PROJECT_ROOT}/node_modules/.bin/tsx" ]] || fail "Project dependencies are missing; run install-decky-whatsapp-linux.sh first."
 
@@ -304,6 +306,7 @@ then
 fi
 
 cd -- "${PROJECT_ROOT}"
+printf 'Starting the bridge in this terminal. The SSH tunnel starts after the bridge passes its local health check.\n'
 printf 'Starting the WhatsApp bridge on 127.0.0.1:%s...\n' "${BRIDGE_PORT}"
 HOST=127.0.0.1 PORT="${BRIDGE_PORT}" node --import tsx src/server.ts &
 BRIDGE_PID=$!
@@ -433,6 +436,7 @@ while true; do
     SSH_PID=""
     fail "Could not verify the launched SSH tunnel's Linux process identity; refusing to monitor or signal an unverifiable PID."
   }
+  printf 'SSH tunnel process launched (PID %s); OpenSSH is connecting and requesting the remote forward. Establishment is not confirmed until authentication succeeds and the forward is accepted.\n' "${SSH_PID}"
 
   while child_is_running "${SSH_PID}" "${SSH_START_TIME}"; do
     if ! child_is_running "${BRIDGE_PID}" "${BRIDGE_START_TIME}"; then
@@ -440,7 +444,8 @@ while true; do
       stop_owned_child "${SSH_PID}" "${SSH_START_TIME}" "reverse SSH tunnel" || true
       SSH_PID=""
       SSH_START_TIME=""
-      fail "Bridge stopped while the SSH tunnel was active."
+      printf "Bridge stopped; closing this launcher and its owned processes cleanly.\n"
+      exit 0
     fi
     sleep 0.3
   done

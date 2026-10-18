@@ -31,7 +31,15 @@ type RuntimeMessage = {
   type?: string;
   hasMedia?: boolean;
   isGif?: boolean;
-  _data?: Record<string, unknown> & { thumbnail?: string; mimetype?: string; isGif?: boolean };
+  isViewOnce?: unknown;
+  isViewOnceV2?: unknown;
+  _data?: Record<string, unknown> & {
+    thumbnail?: string;
+    mimetype?: string;
+    isGif?: boolean;
+    isViewOnce?: unknown;
+    isViewOnceV2?: unknown;
+  };
   getChat: () => Promise<{ id: { _serialized: string; user?: string }; name?: string }>;
   getContact: () => Promise<{ name?: string; pushname?: string; shortName?: string; verifiedName?: string }>;
   downloadMedia: () => Promise<{ mimetype: string; data: string; filename?: string | null } | null | undefined>;
@@ -52,12 +60,17 @@ type RuntimeReactionEvent = {
 
 function formatMessageBody(
   message: { body?: unknown; type?: unknown; fromMe?: unknown },
-  media?: IncomingMessage["media"]
+  media?: IncomingMessage["media"],
+  viewOnce = false
 ): string {
   const type = typeof message.type === "string" ? message.type : "";
   if (type === "revoked") return "[Message deleted]";
   if (type === "call_log" || type === "call") {
     return message.fromMe === true ? "[Outgoing call]" : "[Incoming call]";
+  }
+
+  if (viewOnce) {
+    return typeof message.body === "string" && message.body.trim() ? message.body : "[View-once media]";
   }
 
   const mediaKind = media?.kind || getMediaKind(message);
@@ -68,6 +81,17 @@ function formatMessageBody(
 
   if (typeof message.body === "string" && message.body.trim()) return message.body;
   return "[System message]";
+}
+
+export function isViewOnceMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object") return false;
+  const runtimeMessage = message as {
+    isViewOnce?: unknown;
+    isViewOnceV2?: unknown;
+    _data?: { isViewOnce?: unknown; isViewOnceV2?: unknown };
+  };
+  return runtimeMessage.isViewOnce === true || runtimeMessage.isViewOnceV2 === true
+    || runtimeMessage._data?.isViewOnce === true || runtimeMessage._data?.isViewOnceV2 === true;
 }
 
 function getMediaKind(message: { type?: unknown; isGif?: unknown; _data?: { isGif?: unknown } }): NonNullable<IncomingMessage["media"]>["kind"] | undefined {
@@ -92,6 +116,11 @@ function getMessageId(message: { id?: RuntimeMessageId | string }, fallback: str
   return fallback;
 }
 
+export function getChromiumSandboxArgs(platform: NodeJS.Platform = process.platform): string[] {
+  // The tested Ubuntu environment cannot start Chromium with its default sandbox; Windows keeps Chromium's default sandbox.
+  return platform === "linux" ? ["--no-sandbox", "--disable-setuid-sandbox"] : [];
+}
+
 export class WhatsAppService {
   private readonly client = new Client({
     authStrategy: new LocalAuth({
@@ -99,7 +128,7 @@ export class WhatsAppService {
     }),
     puppeteer: {
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+      args: getChromiumSandboxArgs()
     }
   });
 
@@ -241,15 +270,17 @@ export class WhatsAppService {
       // only when the Deck opens or refreshes the conversation history.
       const media = undefined;
       const sender = await this.getSenderName(message);
+      const viewOnce = isViewOnceMessage(message);
       const incoming: IncomingMessage = {
         id: getMessageId(message, `${chatId}:${message.timestamp}:${message.body || ""}`),
         chatId,
         chatName,
         sender,
-        body: formatMessageBody(message, media),
+        body: formatMessageBody(message, media, viewOnce),
         timestamp: message.timestamp,
         fromMe: message.fromMe,
         ack: getMessageAck(message),
+        viewOnce,
         mediaKind: getMediaKind(message),
         image: undefined,
         media: undefined
@@ -279,14 +310,16 @@ export class WhatsAppService {
 
       const media = undefined;
       const sender = await this.getSenderName(message);
+      const viewOnce = update !== "deleted" && isViewOnceMessage(message);
       const updatedMessage: IncomingMessage = {
         id: getMessageId(message, `${chatId}:${message.timestamp}:${body || message.body || ""}`),
         chatId,
         chatName,
         sender,
-        body: update === "deleted" ? "[Message deleted]" : (body || formatMessageBody(message, media)),
+        body: update === "deleted" ? "[Message deleted]" : (body || formatMessageBody(message, media, viewOnce)),
         timestamp: message.timestamp,
         fromMe: message.fromMe,
+        viewOnce,
         mediaKind: update === "deleted" ? undefined : getMediaKind(message),
         image: undefined,
         media: undefined
@@ -325,7 +358,10 @@ export class WhatsAppService {
         chats = await this.client.getChats();
       }
       console.log(`[chats] WhatsApp returned ${chats.length} chats`);
-      const sortedChats = chats.sort((left, right) => (right.lastMessage?.timestamp ?? 0) - (left.lastMessage?.timestamp ?? 0));
+      const sortedChats = [...chats].sort((left, right) => {
+        const timestampOrder = (right.lastMessage?.timestamp ?? 0) - (left.lastMessage?.timestamp ?? 0);
+        return timestampOrder || left.id._serialized.localeCompare(right.id._serialized);
+      });
       const mappedChats = sortedChats.map((chat) => ({
           chatId: chat.id._serialized,
           chatName: chat.name || chat.id.user || chat.id._serialized,
@@ -426,11 +462,16 @@ export class WhatsAppService {
       console.error("[history] message retrieval failed");
       throw historyError;
     }
-    const hasMore = messages.length > limit;
-    const visibleMessages = hasMore ? messages.slice(-limit) : messages;
+    // whatsapp-web.js usually returns chronological messages, but cache order can
+    // differ between platforms. Keep the source order for messages in the same
+    // second so sent/reply order is not inferred from opaque WhatsApp IDs.
+    const orderedMessages = [...messages].sort((left, right) => (left.timestamp ?? 0) - (right.timestamp ?? 0));
+    const hasMore = orderedMessages.length > limit;
+    const visibleMessages = hasMore ? orderedMessages.slice(-limit) : orderedMessages;
     const toIncoming = async (message: (typeof visibleMessages)[number]): Promise<IncomingMessage> => {
       const id = getMessageId(message, `${chatId}:${message.timestamp}:${message.body}`);
-      const media = await this.getMedia(message);
+      const viewOnce = isViewOnceMessage(message);
+      const media = viewOnce ? undefined : await this.getMedia(message);
       const sender = await this.getSenderName(message);
       let reaction: string | undefined = this.reactionCache.get(id);
       let reactionsList = reaction ? [reaction] : [];
@@ -474,11 +515,12 @@ export class WhatsAppService {
         chatId,
         chatName: chat.name || chat.id.user || chat.id._serialized,
         sender,
-        body: formatMessageBody(message, media),
+        body: formatMessageBody(message, media, viewOnce),
         timestamp: message.timestamp,
         fromMe: message.fromMe,
         ack: getMessageAck(message),
-        mediaKind: media?.kind,
+        viewOnce,
+        mediaKind: getMediaKind(message),
         reaction,
         reactions: reactionsList.length > 0 ? reactionsList : undefined,
         media
@@ -652,6 +694,7 @@ export class WhatsAppService {
 
   // Share in-flight downloads and reuse cached media across concurrent history reads.
   private async getMedia(message: RuntimeMessage): Promise<IncomingMessage["media"]> {
+    if (isViewOnceMessage(message)) return undefined;
     if (!message.hasMedia || !getMediaKind(message)) return undefined;
     const id = getMessageId(message, "");
     if (!id) return this.downloadMedia(message);

@@ -207,9 +207,15 @@ The tunnel makes the PC bridge available as `127.0.0.1:8787` on the Deck:
 ssh -N -T -o ExitOnForwardFailure=yes -R 8787:127.0.0.1:8787 deck@STEAM_DECK_IP
 ```
 
-Leave this window open while using the plugin. The launcher normally starts and
-maintains this tunnel automatically. If automatic discovery cannot find the
-Deck, enter its current IP address when prompted.
+Leave this window open while using the plugin. The foreground launcher normally
+starts and maintains this tunnel automatically. Before starting the bridge, it
+checks only `steamdeck.local`, `steamdeck.lan`, and `steamdeck` through the
+operating system's hostname resolver, then prompts you to confirm or replace
+the suggested name. This bounded lookup is not LAN discovery or a network scan;
+it does not try SSH or authenticate. If none resolve, enter the Deck's hostname
+or current IP address manually. Keeping a hostname lets SSH resolve the Deck
+again after it moves to another network; an IP address must be updated manually
+if it changes.
 
 The bridge itself binds to `127.0.0.1` by default. Keep that setting so the
 WhatsApp service is not exposed directly to other devices on the network.

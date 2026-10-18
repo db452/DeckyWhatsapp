@@ -237,7 +237,7 @@ socketServer.on("connection", (socket, request) => {
     return;
   }
   clients.add(socket);
-  socket.send(JSON.stringify({ type: "status", status: whatsapp.getStatus() } satisfies BridgeEvent));
+  socket.send(JSON.stringify({ type: "status", status: whatsapp.getStatus(), sessionId } satisfies BridgeEvent));
   socket.on("close", () => clients.delete(socket));
 });
 

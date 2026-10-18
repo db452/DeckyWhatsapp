@@ -8,7 +8,9 @@ export type IncomingMessage = {
   timestamp: number;
   fromMe: boolean;
   ack?: number;
+  viewOnce?: boolean;
   deliveryUncertain?: boolean;
+  sendFailureNotice?: string;
   mediaLoadState?: "loading" | "unavailable";
   quotedMessageId?: string;
   mediaKind?: "image" | "sticker" | "gif" | "audio";

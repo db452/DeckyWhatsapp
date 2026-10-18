@@ -8,7 +8,7 @@ export type BridgeStatus =
   | "auth_failure";
 
 export type BridgeEvent =
-  | { type: "status"; status: BridgeStatus }
+  | { type: "status"; status: BridgeStatus; sessionId?: string }
   | { type: "qr"; dataUrl: string }
   | { type: "message"; message: IncomingMessage }
   | { type: "message_update"; update: "edited" | "deleted"; message: IncomingMessage }
@@ -24,6 +24,7 @@ export interface IncomingMessage {
   timestamp: number;
   fromMe: boolean;
   ack?: number;
+  viewOnce?: boolean;
   mediaKind?: "image" | "sticker" | "gif" | "audio";
   reaction?: string;
   reactions?: string[];

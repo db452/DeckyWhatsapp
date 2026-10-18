@@ -1,11 +1,67 @@
 // Exercise bridge startup and API behavior with local processes and ports; no real Deck is contacted.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:net";
 import { once } from "node:events";
 import { test } from "node:test";
+import { WebSocket } from "ws";
 
-test("an occupied port exits cleanly before starting WhatsApp", { timeout: 10_000 }, async (t) => {
+// Windows VM measurements show 3.5–4.5 seconds for PowerShell startup. Keep
+// subprocess waits bounded while allowing that documented startup cost.
+const CHILD_OUTPUT_TIMEOUT_MS = 10_000;
+
+async function stopOwnedChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const closed = once(child, "close").then(() => true);
+  if (process.platform === "win32" && child.pid !== undefined) {
+    // This PID was returned by our spawn; taskkill is scoped to that process tree.
+    const result = spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
+      timeout: CHILD_OUTPUT_TIMEOUT_MS
+    });
+    if (result.error || result.status !== 0) child.kill();
+  } else {
+    child.kill();
+  }
+  const stopped = await new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), CHILD_OUTPUT_TIMEOUT_MS);
+    void closed.then(() => { clearTimeout(timer); resolve(true); });
+  });
+  if (!stopped && child.exitCode === null && child.signalCode === null) child.kill();
+}
+
+function waitForOutput(child: ChildProcessWithoutNullStreams, expected: string, getOutput: () => string): Promise<void> {
+  if (getOutput().includes(expected)) return Promise.resolve();
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.reject(new Error(`Child exited before expected output (code ${child.exitCode}, signal ${child.signalCode}):\n${getOutput()}`));
+  }
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for child output: ${expected}\n${getOutput()}`));
+    }, CHILD_OUTPUT_TIMEOUT_MS);
+    const onData = () => {
+      if (!getOutput().includes(expected)) return;
+      cleanup();
+      resolve();
+    };
+    const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(new Error(`Child exited before expected output (code ${code}, signal ${signal}):\n${getOutput()}`));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.stdout.off("data", onData);
+      child.stderr.off("data", onData);
+      child.off("close", onClose);
+    };
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.once("close", onClose);
+  });
+}
+
+test("an occupied port exits cleanly before starting WhatsApp", { timeout: 20_000 }, async (t) => {
   const occupied = createServer();
   occupied.listen(0, "127.0.0.1");
   await once(occupied, "listening");
@@ -17,7 +73,7 @@ test("an occupied port exits cleanly before starting WhatsApp", { timeout: 10_00
     WhatsAppService.prototype.start = async () => { console.error('UNEXPECTED_BROWSER_START'); };
     await import('./src/server.ts');
   `], { env: { ...process.env, PORT: String(address.port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
-  t.after(() => child.kill());
+  t.after(() => stopOwnedChild(child));
   let output = "";
   child.stdout.on("data", (chunk) => { output += chunk; });
   child.stderr.on("data", (chunk) => { output += chunk; });
@@ -27,7 +83,7 @@ test("an occupied port exits cleanly before starting WhatsApp", { timeout: 10_00
   assert.doesNotMatch(output, /UNEXPECTED_BROWSER_START|Unhandled/);
 });
 
-test("health exposes a runtime session ID only after bridge authentication", { timeout: 10_000 }, async (t) => {
+test("health exposes a runtime session ID only after bridge authentication", { timeout: 20_000 }, async (t) => {
   const reservation = createServer();
   reservation.listen(0, "127.0.0.1");
   await once(reservation, "listening");
@@ -40,17 +96,14 @@ test("health exposes a runtime session ID only after bridge authentication", { t
     WhatsAppService.prototype.start = async () => {};
     await import('./src/server.ts');
   `], { env: { ...process.env, PORT: String(address.port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
-  t.after(() => child.kill());
+  t.after(() => stopOwnedChild(child));
   let output = "";
-  let ready!: () => void;
-  const listening = new Promise<void>((resolve) => { ready = resolve; });
   const append = (chunk: Buffer) => {
     output += chunk.toString();
-    if (output.includes("bridge listening")) ready();
   };
   child.stdout.on("data", append);
   child.stderr.on("data", append);
-  await listening;
+  await waitForOutput(child, "bridge listening", () => output);
 
   const url = `http://127.0.0.1:${address.port}`;
   const bootstrap = await fetch(`${url}/bootstrap`, { headers: { Origin: "https://steamloopback.host" } });
@@ -62,9 +115,17 @@ test("health exposes a runtime session ID only after bridge authentication", { t
   assert.equal(health.ok, true);
   assert.match(health.sessionId, /^[0-9a-f-]{36}$/i);
   assert.notEqual(health.sessionId, token);
+
+  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/events?token=${token}`);
+  t.after(() => socket.terminate());
+  await once(socket, "open");
+  const [rawStatus] = await once(socket, "message");
+  const initialStatus = JSON.parse(rawStatus.toString()) as { type: string; sessionId?: string };
+  assert.equal(initialStatus.type, "status");
+  assert.equal(initialStatus.sessionId, health.sessionId);
 });
 
-test("request parser errors never expose or log private request text", { timeout: 10_000 }, async (t) => {
+test("request parser errors never expose or log private request text", { timeout: 20_000 }, async (t) => {
   const reservation = createServer();
   reservation.listen(0, "127.0.0.1");
   await once(reservation, "listening");
@@ -77,17 +138,14 @@ test("request parser errors never expose or log private request text", { timeout
     WhatsAppService.prototype.start = async () => {};
     await import('./src/server.ts');
   `], { env: { ...process.env, PORT: String(address.port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
-  t.after(() => { if (child.exitCode === null) child.kill(); });
+  t.after(() => stopOwnedChild(child));
   let output = "";
-  let ready!: () => void;
-  const listening = new Promise<void>((resolve) => { ready = resolve; });
   const append = (chunk: Buffer) => {
     output += chunk.toString();
-    if (output.includes("bridge listening")) ready();
   };
   child.stdout.on("data", append);
   child.stderr.on("data", append);
-  await listening;
+  await waitForOutput(child, "bridge listening", () => output);
 
   const url = `http://127.0.0.1:${address.port}`;
   const bootstrap = await fetch(`${url}/bootstrap`, { headers: { Origin: "https://steamloopback.host" } });
@@ -109,7 +167,7 @@ test("request parser errors never expose or log private request text", { timeout
   assert.doesNotMatch(output, new RegExp(privateText));
 });
 
-test("shutdown requires the expected session ID and refuses a replacement session", { timeout: 10_000 }, async (t) => {
+test("shutdown requires the expected session ID and refuses a replacement session", { timeout: 20_000 }, async (t) => {
   const reservation = createServer();
   reservation.listen(0, "127.0.0.1");
   await once(reservation, "listening");
@@ -122,17 +180,14 @@ test("shutdown requires the expected session ID and refuses a replacement sessio
     WhatsAppService.prototype.start = async () => {};
     await import('./src/server.ts');
   `], { env: { ...process.env, PORT: String(address.port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
-  t.after(() => { if (child.exitCode === null) child.kill(); });
+  t.after(() => stopOwnedChild(child));
   let output = "";
-  let ready!: () => void;
-  const listening = new Promise<void>((resolve) => { ready = resolve; });
   const append = (chunk: Buffer) => {
     output += chunk.toString();
-    if (output.includes("bridge listening")) ready();
   };
   child.stdout.on("data", append);
   child.stderr.on("data", append);
-  await listening;
+  await waitForOutput(child, "bridge listening", () => output);
 
   const url = `http://127.0.0.1:${address.port}`;
   const bootstrap = await fetch(`${url}/bootstrap`, { headers: { Origin: "https://steamloopback.host" } });
@@ -158,7 +213,7 @@ test("shutdown requires the expected session ID and refuses a replacement sessio
   assert.equal(exitCode, 0);
 });
 
-test("authenticated legacy shutdown without a body remains supported", { timeout: 10_000 }, async (t) => {
+test("authenticated legacy shutdown without a body remains supported", { timeout: 20_000 }, async (t) => {
   const reservation = createServer();
   reservation.listen(0, "127.0.0.1");
   await once(reservation, "listening");
@@ -171,17 +226,14 @@ test("authenticated legacy shutdown without a body remains supported", { timeout
     WhatsAppService.prototype.start = async () => {};
     await import('./src/server.ts');
   `], { env: { ...process.env, PORT: String(address.port), HOST: "127.0.0.1" }, stdio: ["ignore", "pipe", "pipe"] });
-  t.after(() => { if (child.exitCode === null) child.kill(); });
+  t.after(() => stopOwnedChild(child));
   let output = "";
-  let ready!: () => void;
-  const listening = new Promise<void>((resolve) => { ready = resolve; });
   const append = (chunk: Buffer) => {
     output += chunk.toString();
-    if (output.includes("bridge listening")) ready();
   };
   child.stdout.on("data", append);
   child.stderr.on("data", append);
-  await listening;
+  await waitForOutput(child, "bridge listening", () => output);
 
   const url = `http://127.0.0.1:${address.port}`;
   const bootstrap = await fetch(`${url}/bootstrap`, { headers: { Origin: "https://steamloopback.host" } });
@@ -192,7 +244,7 @@ test("authenticated legacy shutdown without a body remains supported", { timeout
   assert.equal(exitCode, 0);
 });
 
-test("a second bridge binding fails without replacing the first active session", { timeout: 10_000 }, async (t) => {
+test("a second bridge binding fails without replacing the first active session", { timeout: 20_000 }, async (t) => {
   const reservation = createServer();
   reservation.listen(0, "127.0.0.1");
   await once(reservation, "listening");
@@ -210,17 +262,14 @@ test("a second bridge binding fails without replacing the first active session",
     stdio: ["ignore", "pipe", "pipe"]
   });
   const first = startBridge();
-  t.after(() => first.kill());
+  t.after(() => stopOwnedChild(first));
   let firstOutput = "";
-  let firstReady!: () => void;
-  const firstListening = new Promise<void>((resolve) => { firstReady = resolve; });
   const appendFirst = (chunk: Buffer) => {
     firstOutput += chunk.toString();
-    if (firstOutput.includes("bridge listening")) firstReady();
   };
   first.stdout.on("data", appendFirst);
   first.stderr.on("data", appendFirst);
-  await firstListening;
+  await waitForOutput(first, "bridge listening", () => firstOutput);
 
   const url = `http://127.0.0.1:${address.port}`;
   const bootstrap = await fetch(`${url}/bootstrap`, { headers: { Origin: "https://steamloopback.host" } });
@@ -230,6 +279,7 @@ test("a second bridge binding fails without replacing the first active session",
   const originalSession = (await originalHealth.json() as { sessionId: string }).sessionId;
 
   const second = startBridge();
+  t.after(() => stopOwnedChild(second));
   let secondOutput = "";
   second.stdout.on("data", (chunk) => { secondOutput += chunk.toString(); });
   second.stderr.on("data", (chunk) => { secondOutput += chunk.toString(); });

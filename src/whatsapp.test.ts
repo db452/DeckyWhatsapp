@@ -4,10 +4,15 @@ import { createRequire } from "node:module";
 import { test } from "node:test";
 import { setImmediate } from "node:timers/promises";
 import qrcodeTerminal from "qrcode-terminal";
-import { WhatsAppService } from "./whatsapp.js";
+import { getChromiumSandboxArgs, isViewOnceMessage, WhatsAppService } from "./whatsapp.js";
 
 const require = createRequire(import.meta.url);
 const Message = require("whatsapp-web.js/src/structures/Message.js");
+
+test("Chromium sandbox overrides are limited to Linux", () => {
+  assert.deepEqual(getChromiumSandboxArgs("linux"), ["--no-sandbox", "--disable-setuid-sandbox"]);
+  assert.deepEqual(getChromiumSandboxArgs("win32"), []);
+});
 
 test("background QR pairing keeps the plugin QR event but suppresses terminal credentials", async () => {
   const previousMode = process.env.DECKY_WHATSAPP_BACKGROUND;
@@ -41,6 +46,9 @@ function createService() {
   service.mediaCacheBytes = 0;
   service.reactionCache = new Map();
   service.listeners = new Set();
+  service.recentMessages = [];
+  service.contactNameCache = new Map();
+  service.receivedChatIdsSinceSession = new Set();
   service.reconnectAttempt = 0;
   service.reconnecting = false;
   service.stopping = false;
@@ -160,6 +168,71 @@ test("unavailable media can be retried, and the successful cache is bounded", as
   assert.equal(service.mediaCache.has("media-0"), false);
 });
 
+test("view-once history is marked and never attempts a media download", async () => {
+  const service = createService();
+  let downloads = 0;
+  service.status = "ready";
+  service.downloadMedia = async () => {
+    downloads++;
+    return { dataUrl: "data:image/jpeg;base64,AA==", kind: "image", mimetype: "image/jpeg" };
+  };
+  service.getSenderName = async () => "Contact";
+  const viewOnceMessage = {
+    id: "view-once-history",
+    from: "chat-1",
+    fromMe: false,
+    timestamp: 100,
+    body: "",
+    type: "image",
+    hasMedia: true,
+    _data: { isViewOnceV2: true }
+  };
+  service.client = {
+    getChatById: async () => ({
+      id: { _serialized: "chat-1" },
+      name: "Chat",
+      fetchMessages: async () => [viewOnceMessage]
+    })
+  };
+
+  const history = await service.getChatHistory("chat-1");
+  assert.equal(downloads, 0);
+  assert.equal(history.messages[0].viewOnce, true);
+  assert.equal(history.messages[0].body, "[View-once media]");
+  assert.equal(history.messages[0].media, undefined);
+});
+
+test("live view-once events preserve captions and carry the capability flag", async () => {
+  const service = createService();
+  service.getSenderName = async () => "Contact";
+  let event: any;
+  service.onEvent((next: unknown) => { event = next; });
+  await service.publishCreatedMessage({
+    id: "view-once-live",
+    from: "chat-1",
+    fromMe: false,
+    timestamp: 100,
+    body: "A private caption",
+    type: "image",
+    hasMedia: true,
+    isViewOnce: true,
+    getChat: async () => ({ id: { _serialized: "chat-1" }, name: "Chat" })
+  });
+
+  assert.equal(event.type, "message");
+  assert.equal(event.message.viewOnce, true);
+  assert.equal(event.message.body, "A private caption");
+  assert.equal(event.message.media, undefined);
+});
+
+test("view-once runtime flags are recognized on the message and raw data", () => {
+  assert.equal(isViewOnceMessage({ isViewOnce: true }), true);
+  assert.equal(isViewOnceMessage({ isViewOnceV2: true }), true);
+  assert.equal(isViewOnceMessage({ _data: { isViewOnce: true } }), true);
+  assert.equal(isViewOnceMessage({ _data: { isViewOnceV2: true } }), true);
+  assert.equal(isViewOnceMessage({ _data: { isViewOnce: false } }), false);
+});
+
 test("initial startup failure leaves a retryable disconnected state", async () => {
   const service = createService();
   service.client = { initialize: async () => { throw new Error("startup offline"); } };
@@ -218,6 +291,57 @@ test("history bounds concurrent work, preserves captions/order and sends image d
   assert.equal(maximum, 4);
   assert.deepEqual(result.messages.map((message: any) => message.body), messages.map((message) => message.body));
   assert.ok(result.messages.every((message: any) => message.media && !message.image));
+});
+
+test("history sorts unordered WhatsApp results chronologically before selecting the latest window", async () => {
+  const service = createService();
+  service.status = "ready";
+  const messages = [
+    { id: "later", body: "later", fromMe: true, timestamp: 30 },
+    { id: "oldest", body: "oldest", fromMe: true, timestamp: 10 },
+    { id: "middle", body: "middle", fromMe: true, timestamp: 20 },
+    { id: "newest", body: "newest", fromMe: true, timestamp: 40 }
+  ];
+  service.client = { getChatById: async () => ({
+    id: { _serialized: "chat" },
+    fetchMessages: async () => messages
+  }) };
+
+  const result = await service.getChatHistory("chat", 2);
+  assert.equal(result.hasMore, true);
+  assert.deepEqual(result.messages.map((message: any) => message.id), ["later", "newest"]);
+});
+
+test("history preserves fetched order for sent and received messages in the same second", async () => {
+  const service = createService();
+  service.status = "ready";
+  const messages = [
+    { id: "earlier", body: "earlier", fromMe: true, timestamp: 99 },
+    { id: "true_chat_ZZZ", body: "sent", fromMe: true, timestamp: 100 },
+    { id: "false_chat_AAA", body: "reply", fromMe: false, timestamp: 100, from: "contact", getContact: async () => ({ name: "Contact" }) }
+  ];
+  service.client = { getChatById: async () => ({
+    id: { _serialized: "chat" },
+    fetchMessages: async () => messages
+  }) };
+
+  const result = await service.getChatHistory("chat", 2);
+  assert.equal(result.hasMore, true);
+  assert.deepEqual(result.messages.map((message: any) => message.id), ["true_chat_ZZZ", "false_chat_AAA"]);
+});
+
+test("recent chats are sorted newest first with deterministic ties", async () => {
+  const service = createService();
+  service.status = "ready";
+  service.client = { getChats: async () => [
+    { id: { _serialized: "chat-z", user: "z" }, lastMessage: { timestamp: 20, body: "z" } },
+    { id: { _serialized: "chat-new", user: "new" }, lastMessage: { timestamp: 30, body: "new" } },
+    { id: { _serialized: "chat-b", user: "b" }, lastMessage: { timestamp: 20, body: "b" } },
+    { id: { _serialized: "chat-empty", user: "empty" } }
+  ] };
+
+  const result = await service.getRecentChats();
+  assert.deepEqual(result.chats.map((chat: any) => chat.chatId), ["chat-new", "chat-b", "chat-z", "chat-empty"]);
 });
 
 test("fresh reaction lookup clears a reaction removed on another device", async () => {

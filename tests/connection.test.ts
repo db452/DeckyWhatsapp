@@ -2,7 +2,16 @@
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 import { setImmediate } from "node:timers/promises";
-import { connectSocket, createQueuedRequest, fetchWithTimeout } from "../decky-plugin/src/connection.ts";
+import { connectSocket, createQueuedRequest, createRevisionGuard, fetchWithTimeout } from "../decky-plugin/src/connection.ts";
+
+test("a stale contact snapshot is rejected after a newer live event", () => {
+  const revision = createRevisionGuard();
+  const inFlightSnapshot = revision.capture();
+  revision.invalidate();
+  assert.equal(revision.isCurrent(inFlightSnapshot), false);
+  const refreshedSnapshot = revision.capture();
+  assert.equal(revision.isCurrent(refreshedSnapshot), true);
+});
 
 test("a ready-state refresh queues behind a failing initial contacts request", async () => {
   let attempt = 0;

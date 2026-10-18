@@ -1,6 +1,6 @@
 // Exercise tunnel supervision with local mock SSH processes and sockets; no real Deck is contacted.
 import assert from "node:assert/strict";
-import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFileSync, spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { createConnection, createServer } from "node:net";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -13,10 +13,55 @@ const tunnelScript = join(process.cwd(), "keep-ssh-tunnel.ps1");
 const launcherScript = join(process.cwd(), "start-decky-whatsapp.bat");
 const backgroundControllerScript = join(process.cwd(), "manage-decky-whatsapp.ps1");
 const conflictMessage = "SSH could not establish remote forwarding on port";
+// The Windows guest measured 3.5–4.5 seconds to start a trivial PowerShell child.
+// Allow one startup budget plus output scheduling time, while keeping waits bounded.
+const WINDOWS_PROCESS_STARTUP_BUDGET_MS = 5_000;
+const WINDOWS_OUTPUT_WAIT_MS = WINDOWS_PROCESS_STARTUP_BUDGET_MS * 2 + 3_000;
+const WINDOWS_NESTED_PROCESS_WAIT_MS = WINDOWS_PROCESS_STARTUP_BUDGET_MS * 3 + 3_000;
+const WINDOWS_RECOVERY_STAGE_WAIT_MS = WINDOWS_PROCESS_STARTUP_BUDGET_MS * 4 + 3_000;
+// The Windows guest's combined run exceeded 23 seconds here; the isolated test passes in 44.2 seconds overall.
+// Allow up to 40 seconds for C to start and claim ownership, within the test's 90-second deadline.
+const WINDOWS_SLOW_RECONNECT_STARTUP_WAIT_MS = 40_000;
+const DEFAULT_FILE_WAIT_MS = WINDOWS_PROCESS_STARTUP_BUDGET_MS * 2;
+
+function isChildRunning(child: ChildProcessWithoutNullStreams): boolean {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+function acknowledgeChild(child: ChildProcessWithoutNullStreams): void {
+  if (isChildRunning(child) && child.stdin.writable && !child.stdin.destroyed) child.stdin.write("\r\n");
+}
+
+async function stopOwnedChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (!isChildRunning(child)) return;
+  const closed = once(child, "close").then(() => true);
+  if (process.platform === "win32" && child.pid !== undefined) {
+    // PID came directly from this test's spawn; /T is limited to its descendants.
+    const result = spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
+      timeout: WINDOWS_PROCESS_STARTUP_BUDGET_MS
+    });
+    if (result.error || result.status !== 0) child.kill();
+  } else {
+    child.kill();
+  }
+  const stopped = await new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), WINDOWS_PROCESS_STARTUP_BUDGET_MS);
+    void closed.then(() => { clearTimeout(timer); resolve(true); });
+  });
+  if (!stopped && isChildRunning(child)) child.kill();
+}
 
 function watchOutput(child: ChildProcessWithoutNullStreams) {
   let output = "";
   const waiters: Array<{ text: string; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }> = [];
+  const failWaiters = (error: Error) => {
+    for (const waiter of [...waiters]) {
+      clearTimeout(waiter.timer);
+      waiters.splice(waiters.indexOf(waiter), 1);
+      waiter.reject(error);
+    }
+  };
   const append = (chunk: Buffer) => {
     output += chunk.toString();
     for (const waiter of [...waiters]) {
@@ -28,10 +73,16 @@ function watchOutput(child: ChildProcessWithoutNullStreams) {
   };
   child.stdout.on("data", append);
   child.stderr.on("data", append);
+  child.once("close", (code, signal) => {
+    failWaiters(new Error(`Child exited before expected output (code ${code}, signal ${signal}):\n${output}`));
+  });
   return {
     get output() { return output; },
-    waitFor(text: string, timeoutMs = 8000) {
+    waitFor(text: string, timeoutMs = WINDOWS_OUTPUT_WAIT_MS) {
       if (output.includes(text)) return Promise.resolve();
+      if (child.exitCode !== null || child.signalCode !== null) {
+        return Promise.reject(new Error(`Child exited before expected output (code ${child.exitCode}, signal ${child.signalCode}):\n${output}`));
+      }
       return new Promise<void>((resolve, reject) => {
         const waiter = {
           text,
@@ -48,21 +99,27 @@ function watchOutput(child: ChildProcessWithoutNullStreams) {
   };
 }
 
-async function waitForFile(path: string, timeoutMs = 5000): Promise<void> {
+async function waitForFile(path: string, timeoutMs = DEFAULT_FILE_WAIT_MS, child?: ChildProcessWithoutNullStreams): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     try { await access(path); return; }
     catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
+    if (child && (child.exitCode !== null || child.signalCode !== null)) {
+      throw new Error(`Child exited before creating ${path} (code ${child.exitCode}, signal ${child.signalCode})`);
+    }
   }
   throw new Error(`Timed out waiting for ${path}`);
 }
 
-async function waitForFileContent(path: string, expected: string, timeoutMs = 5000): Promise<void> {
+async function waitForFileContent(path: string, expected: string, timeoutMs = DEFAULT_FILE_WAIT_MS, child?: ChildProcessWithoutNullStreams): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     try {
       if ((await readFile(path, "utf8")).trim() === expected) return;
     } catch { /* The owner file is created by the process that wins the atomic reservation. */ }
+    if (child && (child.exitCode !== null || child.signalCode !== null)) {
+      throw new Error(`Child exited before ${path} contained ${expected} (code ${child.exitCode}, signal ${child.signalCode})`);
+    }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`Timed out waiting for ${path} to contain ${expected}`);
@@ -91,7 +148,7 @@ test("Linux SSH log reader drains and captures diagnostics without writing to th
   const child = spawn(process.execPath, [
     "--input-type=module", "-e", `process.stderr.write = () => { throw new Error('terminal output attempted'); };\n${readerSource}`, outputPath
   ], { stdio: ["pipe", "ignore", "ignore"] });
-  t.after(() => { if (child.exitCode === null) child.kill(); });
+  t.after(() => stopOwnedChild(child));
   child.stdin.end(Buffer.alloc(256 * 1024, 0x61));
   const [exitCode] = await once(child, "close");
   assert.equal(exitCode, 0, "the reader exits after consuming all input despite stderr backpressure");
@@ -111,13 +168,90 @@ test("Linux SSH FIFO keepalive remains open until the SSH writer has exited", as
   assert.match(shell.slice(launch, wait), /<\/dev\/tty/, "SSH continues to read password and passphrase prompts directly from the terminal");
 });
 
+test("the Linux launcher resolves installer-style symlinks before loading project helpers", async () => {
+  const launcher = await readFile(join(process.cwd(), "start-decky-whatsapp-linux.sh"), "utf8");
+  const symlinkResolution = launcher.indexOf('while [[ -L "${source_path}" ]]; do');
+  const helperSource = launcher.indexOf('source "${PROJECT_ROOT}/scripts/launcher-validation.sh"');
+  const optionHandling = launcher.indexOf('while (($#)); do');
+  assert.ok(symlinkResolution >= 0 && helperSource > symlinkResolution && optionHandling > helperSource,
+    "an installer-created shortcut outside the checkout resolves to the project before sourcing its helper or handling options");
+});
+
 test("the Windows launcher refuses a second local bridge without shutting down the active one", async () => {
   const launcher = await readFile(launcherScript, "utf8");
   const tunnel = await readFile(tunnelScript, "utf8");
   assert.match(launcher, /BeginConnect\('127\.0\.0\.1', %BRIDGE_PORT%/);
   assert.match(launcher, /Close its window explicitly before starting another session/);
+  assert.match(launcher, /node\.exe scripts\\read-bridge-port\.mjs/,
+    "the Windows launcher resolves the same inherited environment and .env port as the bridge");
+  const clearPort = launcher.indexOf('set "BRIDGE_PORT="');
+  const readPort = launcher.indexOf("scripts\\read-bridge-port.mjs");
+  const portGuard = launcher.indexOf("if not defined BRIDGE_PORT");
+  const resolveHost = launcher.indexOf("echo Checking a small set of conventional Steam Deck hostnames");
+  assert.ok(clearPort >= 0 && clearPort < readPort && readPort < portGuard && portGuard < resolveHost,
+    "the batch launcher clears an inherited BRIDGE_PORT and aborts on reader failure before host discovery or startup");
+  assert.match(launcher, /pushd "%PROJECT_DIR%"[^\r\n]*\r?\nfor \/f[\s\S]*?\r?\npopd/,
+    "the launcher restores the caller's working directory immediately after reading .env");
+  assert.match(launcher, /process\.versions\.node\.split\('\.'\)\[0\]\) >= 22/,
+    "the Windows launcher rejects unsupported Node versions before starting either process");
+  assert.match(launcher, /node\.exe scripts\\suggest-deck-host\.mjs/,
+    "Deck hostname suggestions use the bounded OS resolver helper");
+  assert.match(launcher, /if defined DECK_HOST exit \/b 0/,
+    "an explicitly configured Deck host bypasses suggestions");
+  assert.match(launcher, /Invalid or unresolvable Deck address/,
+    "manual Deck input is checked before starting the bridge");
+  assert.match(launcher, /set PORT=%BRIDGE_PORT%&& npm\.cmd start/,
+    "the bridge and reverse tunnel receive the same normalized port");
   assert.doesNotMatch(launcher, /NoExit|\/shutdown|fuser|Stop-Process|Terminate/i);
   assert.match(tunnel, /Read-Host "Press Enter to close this window"/);
+});
+
+test("the shared launcher port reader honors environment precedence and normalizes decimal values", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "decky-port-config-test-"));
+  const portReader = join(process.cwd(), "scripts", "read-bridge-port.mjs");
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(join(directory, ".env"), "PORT=09090\n");
+
+  const inheritedEnvironment = { ...process.env, PORT: "08787" };
+  assert.equal(execFileSync(process.execPath, [portReader], { cwd: directory, env: inheritedEnvironment, encoding: "utf8" }), "8787");
+  const dotenvEnvironment = { ...process.env };
+  delete dotenvEnvironment.PORT;
+  assert.equal(execFileSync(process.execPath, [portReader], { cwd: directory, env: dotenvEnvironment, encoding: "utf8" }), "9090");
+  assert.throws(() => execFileSync(process.execPath, [portReader], {
+    cwd: directory,
+    env: { ...process.env, PORT: "65536" },
+    encoding: "utf8",
+    stdio: "pipe"
+  }));
+
+  const inheritedBridgePort = spawnSync(process.execPath, [portReader], {
+    cwd: directory,
+    env: { ...process.env, PORT: "invalid", BRIDGE_PORT: "8787" },
+    encoding: "utf8"
+  });
+  assert.notEqual(inheritedBridgePort.status, 0);
+  assert.equal(inheritedBridgePort.stdout, "",
+    "an invalid PORT yields no value that could be confused with an inherited batch BRIDGE_PORT");
+});
+
+test("confirmed bridge shutdown lets Linux and Windows foreground launchers close their owned tunnels", async () => {
+  const linux = await readFile(join(process.cwd(), "keep-ssh-tunnel.sh"), "utf8");
+  const windows = await readFile(tunnelScript, "utf8");
+  const launcher = await readFile(launcherScript, "utf8");
+
+  assert.match(linux, /if ! child_is_running "\$\{BRIDGE_PID\}" "\$\{BRIDGE_START_TIME\}"; then[\s\S]*?stop_owned_child "\$\{SSH_PID\}" "\$\{SSH_START_TIME\}" "reverse SSH tunnel"[\s\S]*?exit 0/,
+    "Linux observes its owned bridge exit, stops only its owned SSH process, and exits successfully");
+  assert.match(linux, /trap cleanup EXIT/,
+    "Linux runs ownership-checked cleanup before its foreground supervisor exits");
+
+  assert.match(launcher, /cmd \/c "set PORT=%BRIDGE_PORT%&& npm\.cmd start"/,
+    "the Windows bridge command window closes when npm start returns");
+  assert.match(windows, /function Stop-OwnedTunnel[\s\S]*?\$Process\.Kill\(\)[\s\S]*?\$Process\.WaitForExit\(\)/,
+    "the Windows supervisor waits for the SSH process it launched to exit");
+  assert.match(windows, /if \(-not \(Test-BridgeListening\)\) \{[\s\S]*?Stop-OwnedTunnel \$sshProcess[\s\S]*?exit 0/,
+    "the Windows tunnel window exits after its bridge stops");
+  assert.doesNotMatch(launcher, /cmd \/k|NoExit/i,
+    "the Windows foreground launcher does not keep the bridge window open after exit");
 });
 
 test("optional background controller isolates its child port and protects recorded process ownership", async () => {
@@ -179,7 +313,7 @@ test("Stop recovers an expected session ID for a healthy owned partial startup",
   const bridge = spawn(process.execPath, ["-e", source, "src/server.ts"], {
     env: { ...process.env, PORT: String(address.port) }, stdio: ["ignore", "pipe", "pipe"]
   });
-  t.after(() => { if (bridge.exitCode === null) bridge.kill(); });
+  t.after(() => stopOwnedChild(bridge));
   assert.ok(bridge.pid);
   const started = Date.now();
   while (Date.now() - started < 5000) {
@@ -217,7 +351,7 @@ test("Stop recovers an expected session ID for a healthy owned partial startup",
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", backgroundControllerScript,
     "-Action", "Stop", "-RuntimeDir", runtimeDir
   ], { stdio: ["ignore", "pipe", "pipe"] });
-  t.after(() => { if (controller.exitCode === null) controller.kill(); });
+  t.after(() => stopOwnedChild(controller));
   const output = watchOutput(controller);
   const [exitCode] = await once(controller, "close");
   assert.equal(exitCode, 0, output.output);
@@ -237,7 +371,7 @@ test("Stop recovers an expected session ID for a healthy owned partial startup",
   assert.equal(updatedState.ExpectedSessionId, expectedSessionId);
 });
 
-test("normal supervisor exit on a closed bridge port does not wait for input", { timeout: 5000 }, async (t) => {
+test("normal supervisor exit on a closed bridge port does not wait for input", { timeout: 12_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
   const reservation = createServer();
   reservation.listen(0, "127.0.0.1");
@@ -250,7 +384,7 @@ test("normal supervisor exit on a closed bridge port does not wait for input", {
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
     "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port)
   ], { stdio: ["pipe", "pipe", "pipe"] });
-  t.after(() => { if (child.exitCode === null) child.kill(); });
+  t.after(() => stopOwnedChild(child));
   const output = watchOutput(child);
   const [code] = await once(child, "close");
   assert.equal(code, 0);
@@ -258,7 +392,7 @@ test("normal supervisor exit on a closed bridge port does not wait for input", {
   assert.doesNotMatch(output.output, /Press Enter|Retrying/);
 });
 
-test("background supervisor closes its SSH child when the recorded bridge exits even if the port is reused", { timeout: 15_000 }, async (t) => {
+test("background supervisor closes its SSH child when the recorded bridge exits even if the port is reused", { timeout: 20_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const reservation = createServer();
@@ -275,7 +409,7 @@ test("background supervisor closes its SSH child when the recorded bridge exits 
 
   const bridgeSource = `const net = require('node:net'); const server = net.createServer(); server.listen(${address.port}, '127.0.0.1', () => console.log('OWNED_BRIDGE_READY')); setInterval(() => {}, 1000);`;
   const bridge = spawn(process.execPath, ["-e", bridgeSource], { stdio: ["ignore", "pipe", "pipe"] });
-  t.after(() => { if (bridge.exitCode === null) bridge.kill(); });
+  t.after(() => stopOwnedChild(bridge));
   const bridgeOutput = watchOutput(bridge);
   await bridgeOutput.waitFor("OWNED_BRIDGE_READY");
   assert.ok(bridge.pid);
@@ -289,9 +423,9 @@ test("background supervisor closes its SSH child when the recorded bridge exits 
     "-BridgeProcessId", String(bridge.pid), "-BridgeStartTimeUtcTicks", startTicks,
     "-SshExecutable", powershell, "-SshArgumentsOverrideBase64", override
   ], { stdio: ["ignore", "pipe", "pipe"] });
-  t.after(() => { if (supervisor.exitCode === null) supervisor.kill(); });
+  t.after(() => stopOwnedChild(supervisor));
   const supervisorOutput = watchOutput(supervisor);
-  try { await waitForFile(mockSshPidPath); }
+  try { await waitForFile(mockSshPidPath, DEFAULT_FILE_WAIT_MS, supervisor); }
   catch (error) { throw new Error(`${error instanceof Error ? error.message : error}\n${supervisorOutput.output}`); }
 
   bridge.kill();
@@ -309,7 +443,7 @@ test("background supervisor closes its SSH child when the recorded bridge exits 
   client.destroy();
 });
 
-test("SSH forwarding policy failures show the SSH diagnostic without claiming another bridge is active", { timeout: 10_000 }, async (t) => {
+test("SSH forwarding policy failures show the SSH diagnostic without claiming another bridge is active", { timeout: 20_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const bridge = createServer();
@@ -328,8 +462,8 @@ test("SSH forwarding policy failures show the SSH diagnostic without claiming an
   ], { stdio: ["pipe", "pipe", "pipe"] });
   t.after(async () => {
     await new Promise<void>((resolve) => bridge.close(() => resolve()));
-    if (child.exitCode === null) child.stdin.write("\r\n");
-    if (child.exitCode === null) await once(child, "close");
+    acknowledgeChild(child);
+    await stopOwnedChild(child);
     await rm(directory, { recursive: true, force: true });
   });
 
@@ -345,7 +479,7 @@ test("SSH forwarding policy failures show the SSH diagnostic without claiming an
   assert.equal(exitCode, 1);
 });
 
-test("an unidentified forwarding conflict gets one delayed, non-interactive retry while the same bridge owns the port", { timeout: 15_000 }, async (t) => {
+test("an unidentified forwarding conflict gets one delayed, non-interactive retry while the same bridge owns the port", { timeout: 30_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const bridge = createServer();
@@ -372,15 +506,18 @@ exit 255
     "-DiagnosticProbeOverrideBase64", unknownProbeOverride
   ], { stdio: ["pipe", "pipe", "pipe"] });
   t.after(async () => {
-    if (child.exitCode === null) child.stdin.write("\r\n");
-    if (child.exitCode === null) await once(child, "close");
+    acknowledgeChild(child);
+    await stopOwnedChild(child);
     await new Promise<void>((resolve) => bridge.close(() => resolve()));
     await rm(directory, { recursive: true, force: true });
   });
 
   const output = watchOutput(child);
   const startedAt = Date.now();
-  await output.waitFor("The launcher is stopping without prompting or retrying again", 10_000);
+  await output.waitFor(
+    "The launcher is stopping without prompting or retrying again",
+    WINDOWS_PROCESS_STARTUP_BUDGET_MS * 4 + 3_000
+  );
   assert.ok(Date.now() - startedAt >= 900, "the retry waits for the configured expiry interval");
   assert.match(output.output, /same local bridge process is still active; making one non-interactive SSH forwarding retry/);
   assert.match(output.output, /port may still be occupied/);
@@ -390,7 +527,7 @@ exit 255
   assert.equal((await readFile(callsPath, "utf8")).trim().split(/\r?\n/).length, 2, "only the initial attempt and one recovery retry run");
 });
 
-test("the stale-port retry stops when BatchMode cannot authenticate instead of prompting or looping", { timeout: 15_000 }, async (t) => {
+test("the stale-port retry stops when BatchMode cannot authenticate instead of prompting or looping", { timeout: 30_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const bridge = createServer();
@@ -420,14 +557,14 @@ exit 255
     "-DiagnosticProbeOverrideBase64", unknownProbeOverride
   ], { stdio: ["pipe", "pipe", "pipe"] });
   t.after(async () => {
-    if (child.exitCode === null) child.stdin.write("\r\n");
-    if (child.exitCode === null) await once(child, "close");
+    acknowledgeChild(child);
+    await stopOwnedChild(child);
     await new Promise<void>((resolve) => bridge.close(() => resolve()));
     await rm(directory, { recursive: true, force: true });
   });
 
   const output = watchOutput(child);
-  await output.waitFor("could not authenticate without prompting", 10_000);
+  await output.waitFor("could not authenticate without prompting", WINDOWS_RECOVERY_STAGE_WAIT_MS);
   const [exitCode] = await once(child, "close");
   assert.equal(exitCode, 1);
   assert.match(output.output, /Password-only SSH or a key that requires an unavailable passphrase cannot recover automatically/);
@@ -435,7 +572,7 @@ exit 255
   assert.equal((await readFile(callsPath, "utf8")).trim().split(/\r?\n/).length, 2);
 });
 
-test("the stale-port retry stops after a transport failure without a third interactive attempt", { timeout: 15_000 }, async (t) => {
+test("the stale-port retry stops after a transport failure without a third interactive attempt", { timeout: 30_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const bridge = createServer();
@@ -465,14 +602,14 @@ exit 255
     "-DiagnosticProbeOverrideBase64", unknownProbeOverride
   ], { stdio: ["pipe", "pipe", "pipe"] });
   t.after(async () => {
-    if (child.exitCode === null) child.stdin.write("\r\n");
-    if (child.exitCode === null) await once(child, "close");
+    acknowledgeChild(child);
+    await stopOwnedChild(child);
     await new Promise<void>((resolve) => bridge.close(() => resolve()));
     await rm(directory, { recursive: true, force: true });
   });
 
   const output = watchOutput(child);
-  await output.waitFor("The launcher is stopping without prompting or retrying again", 10_000);
+  await output.waitFor("The launcher is stopping without prompting or retrying again", WINDOWS_RECOVERY_STAGE_WAIT_MS);
   const [exitCode] = await once(child, "close");
   assert.equal(exitCode, 1);
   assert.match(output.output, /transport, host-key, or other connection error/);
@@ -480,7 +617,7 @@ exit 255
   assert.equal((await readFile(callsPath, "utf8")).trim().split(/\r?\n/).length, 2);
 });
 
-test("the stale-port retry stays supervised when SSH connects successfully", { timeout: 15_000 }, async (t) => {
+test("the stale-port retry stays supervised when SSH connects successfully", { timeout: 30_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const bridge = createServer();
@@ -522,18 +659,18 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   ], { stdio: ["pipe", "pipe", "pipe"] });
   t.after(async () => {
     await closeBridge();
-    if (supervisor.exitCode === null) {
+    if (isChildRunning(supervisor)) {
       const stopped = await Promise.race([
         once(supervisor, "close").then(() => true),
         new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3000))
       ]);
-      if (!stopped && supervisor.exitCode === null) supervisor.kill();
+      if (!stopped && isChildRunning(supervisor)) await stopOwnedChild(supervisor);
     }
     await rm(directory, { recursive: true, force: true });
   });
 
   const output = watchOutput(supervisor);
-  await waitForFile(sshPidPath);
+  await waitForFile(sshPidPath, WINDOWS_RECOVERY_STAGE_WAIT_MS, supervisor);
   assert.equal(supervisor.exitCode, null, "the retry process remains under supervision until the bridge stops");
   assert.match(output.output, /making one non-interactive SSH forwarding retry/);
   assert.equal((await readFile(callsPath, "utf8")).trim().split(/\r?\n/).length, 2);
@@ -544,7 +681,7 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   assert.match(output.output, /Closing this launcher.s SSH tunnel/);
 });
 
-test("a confirmed stale-port retry may reconnect normally after a later transport drop", { timeout: 20_000 }, async (t) => {
+test("a confirmed stale-port retry may reconnect normally after a later transport drop", { timeout: 40_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const bridge = createServer();
@@ -593,21 +730,21 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   };
   t.after(async () => {
     await closeBridge();
-    if (supervisor.exitCode === null) {
+    if (isChildRunning(supervisor)) {
       const stopped = await Promise.race([
         once(supervisor, "close").then(() => true),
         new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3000))
       ]);
-      if (!stopped && supervisor.exitCode === null) supervisor.kill();
+      if (!stopped && isChildRunning(supervisor)) await stopOwnedChild(supervisor);
     }
     await rm(directory, { recursive: true, force: true });
   });
 
   const output = watchOutput(supervisor);
-  await waitForFile(retryPidPath);
-  await output.waitFor("SSH tunnel disconnected. Retrying in 3 seconds", 10_000);
+  await waitForFile(retryPidPath, WINDOWS_RECOVERY_STAGE_WAIT_MS, supervisor);
+  await output.waitFor("SSH tunnel disconnected. Retrying in 3 seconds", WINDOWS_RECOVERY_STAGE_WAIT_MS);
   assert.match(output.output, /remote forward was established/);
-  await waitForFile(reconnectPidPath, 10_000);
+  await waitForFile(reconnectPidPath, WINDOWS_RECOVERY_STAGE_WAIT_MS, supervisor);
   assert.equal((await readFile(callsPath, "utf8")).trim().split(/\r?\n/).length, 3);
   assert.equal(supervisor.exitCode, null, "the normal reconnect remains supervised while the bridge is listening");
   assert.match(output.output, /SSH tunnel disconnected\. Retrying in 3 seconds/);
@@ -641,9 +778,9 @@ exit 255
   const bridgeSource = `const n=require('node:net');const s=n.createServer();s.listen(${address.port},'127.0.0.1',()=>console.log('BRIDGE_READY'));setInterval(()=>{},1000);`;
   const launchBridge = () => spawn(process.execPath, ["-e", bridgeSource], { stdio: ["ignore", "pipe", "pipe"] });
   const bridge = launchBridge();
+  t.after(() => stopOwnedChild(bridge));
   const bridgeOutput = watchOutput(bridge);
   await bridgeOutput.waitFor("BRIDGE_READY");
-  t.after(() => { if (bridge.exitCode === null) bridge.kill(); });
 
   const sshOverride = Buffer.from(JSON.stringify(["-NoProfile", "-File", mockSshPath, callsPath])).toString("base64");
   const unknownProbeOverride = Buffer.from(JSON.stringify(["-NoProfile", "-Command", "exit 255"])).toString("base64");
@@ -655,7 +792,7 @@ exit 255
     "-DiagnosticProbeOverrideBase64", unknownProbeOverride
   ], { stdio: ["pipe", "pipe", "pipe"] });
   t.after(async () => {
-    if (supervisor.exitCode === null) supervisor.kill();
+    await stopOwnedChild(supervisor);
     await rm(directory, { recursive: true, force: true });
   });
 
@@ -665,7 +802,7 @@ exit 255
   bridge.kill();
   await once(bridge, "close");
   const replacement = launchBridge();
-  t.after(() => { if (replacement.exitCode === null) replacement.kill(); });
+  t.after(() => stopOwnedChild(replacement));
   const replacementOutput = watchOutput(replacement);
   try { await replacementOutput.waitFor("BRIDGE_READY"); }
   catch (error) { throw new Error(`${String(error)}\nReplacement bridge output:\n${replacementOutput.output}`); }
@@ -676,7 +813,7 @@ exit 255
   assert.equal((await readFile(callsPath, "utf8")).trim().split(/\r?\n/).length, 1);
 });
 
-test("stale-port wait exits promptly when the owned bridge stops", { timeout: 15_000 }, async (t) => {
+test("stale-port wait exits promptly when the owned bridge stops", { timeout: 20_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const reservation = createServer();
@@ -697,7 +834,7 @@ exit 255
 `, "utf8");
   const bridgeSource = `const n=require('node:net');const s=n.createServer();s.listen(${address.port},'127.0.0.1',()=>console.log('BRIDGE_READY'));setInterval(()=>{},1000);`;
   const bridge = spawn(process.execPath, ["-e", bridgeSource], { stdio: ["ignore", "pipe", "pipe"] });
-  t.after(() => { if (bridge.exitCode === null) bridge.kill(); });
+  t.after(() => stopOwnedChild(bridge));
   await watchOutput(bridge).waitFor("BRIDGE_READY");
 
   const sshOverride = Buffer.from(JSON.stringify(["-NoProfile", "-File", mockSshPath, callsPath])).toString("base64");
@@ -710,7 +847,7 @@ exit 255
     "-DiagnosticProbeOverrideBase64", unknownProbeOverride
   ], { stdio: ["pipe", "pipe", "pipe"] });
   t.after(async () => {
-    if (supervisor.exitCode === null) supervisor.kill();
+    await stopOwnedChild(supervisor);
     await rm(directory, { recursive: true, force: true });
   });
 
@@ -726,7 +863,9 @@ exit 255
   assert.equal((await readFile(callsPath, "utf8")).trim().split(/\r?\n/).length, 1);
 });
 
-test("forwarding conflicts identify HTTP owners, bound response reads, and clean up the probe", { timeout: 30_000 }, async (t) => {
+// Five scenarios can each start the supervisor, mock SSH, and diagnostic probe;
+// reserve 3 × 5s startup plus a bounded response/cleanup window per scenario.
+test("forwarding conflicts identify HTTP owners, bound response reads, and clean up the probe", { timeout: 140_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const bridge = createServer();
@@ -735,57 +874,42 @@ test("forwarding conflicts identify HTTP owners, bound response reads, and clean
   const address = bridge.address();
   assert.ok(address && typeof address !== "string");
   const directory = await mkdtemp(join(tmpdir(), "decky-tunnel-owner-test-"));
-  const failureScript = join(directory, "forward-failure.ps1");
-  const probeScript = join(directory, "probe-service.ps1");
-  await writeFile(failureScript, "[Console]::Error.WriteLine('Warning: remote port forwarding failed for listen port 8787')\nexit 255\n", "utf8");
+  const failureScript = join(directory, "forward-failure.mjs");
+  const probeScript = join(directory, "probe-service.mjs");
+  await writeFile(failureScript,
+    "process.stderr.write('Warning: remote port forwarding failed for listen port 8787\\n'); process.exitCode = 255;\n", "utf8");
   await writeFile(probeScript, `
-param([string]$Mode, [int]$Port, [string]$PidPath, [string]$OwnerPath, [string]$ErrorPath)
-$listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
-$listener.Start()
-Set-Content -LiteralPath $PidPath -Value $PID
-Set-Content -LiteralPath $OwnerPath -Value 'existing-Deck-service'
-while ($true) {
-  $client = $listener.AcceptTcpClient()
-  try {
-    $stream = $client.GetStream()
-    $client.ReceiveTimeout = 1000
-    $request = New-Object System.IO.MemoryStream
-    $buffer = New-Object byte[] 1024
-    while ($request.Length -lt 8192) {
-      $read = $stream.Read($buffer, 0, $buffer.Length)
-      if ($read -le 0) { break }
-      $request.Write($buffer, 0, $read)
-      $requestText = [System.Text.Encoding]::ASCII.GetString($request.ToArray())
-      if ($requestText.Contains([string][char]13 + [char]10 + [char]13 + [char]10)) { break }
-    }
-    if ($request.Length -eq 0) { continue }
-    $body = if ($Mode -eq 'other') { '<html>another service</html>' } else { '{"error":"Bridge authorization required"}' }
-    if ($Mode -eq 'oversized') { $body = 'x' * 256 }
-    $status = if ($Mode -eq 'other') { '200 OK' } else { '401 Unauthorized' }
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-    $newline = [string][char]13 + [char]10
-    $contentLength = if ($Mode -eq 'streaming') { 100 } else { $bytes.Length }
-    $headerText = 'HTTP/1.1 ' + $status + $newline + 'Content-Type: application/json' + $newline + 'Content-Length: ' + $contentLength + $newline + 'Connection: close' + $newline + $newline
-    $header = [System.Text.Encoding]::ASCII.GetBytes($headerText)
-    $stream.Write($header, 0, $header.Length)
-    if ($Mode -eq 'streaming') {
-      foreach ($byte in $bytes) {
-        $stream.WriteByte($byte)
-        $stream.Flush()
-        Start-Sleep -Milliseconds 200
-      }
-      continue
-    }
-    $stream.Write($bytes, 0, $bytes.Length)
-    $stream.Flush()
-  } catch { Set-Content -LiteralPath $ErrorPath -Value $_.Exception.ToString() }
-  finally { $client.Close() }
-}
+import fs from 'node:fs';
+import http from 'node:http';
+const [mode, portText, pidPath, ownerPath, errorPath] = process.argv.slice(2);
+const server = http.createServer((_request, response) => {
+  const body = mode === 'other' ? '<html>another service</html>' :
+    mode === 'oversized' ? 'x'.repeat(256) :
+    mode === 'streaming' ? 'x'.repeat(100) : '{"error":"Bridge authorization required"}';
+  const statusCode = mode === 'other' ? 200 : 401;
+  response.writeHead(statusCode, { 'Content-Length': mode === 'streaming' ? 100 : Buffer.byteLength(body), 'Connection': 'close' });
+  if (mode === 'streaming') {
+    let sent = 0;
+    const interval = setInterval(() => { response.write('x'); sent += 1; }, 200);
+    const deadline = setTimeout(() => response.destroy(), 10_000);
+    response.on('close', () => { clearInterval(interval); clearTimeout(deadline); });
+    return;
+  }
+  response.end(body);
+});
+server.on('error', (error) => {
+  fs.writeFileSync(errorPath, error.stack || String(error));
+  process.exitCode = 1;
+});
+server.listen(Number(portText), '127.0.0.1', () => {
+  fs.writeFileSync(pidPath, String(process.pid));
+  fs.writeFileSync(ownerPath, 'existing-Deck-service');
+});
 `, "utf8");
 
-  const failureOverride = Buffer.from(JSON.stringify(["-NoProfile", "-File", failureScript])).toString("base64");
+  const failureOverride = Buffer.from(JSON.stringify([failureScript])).toString("base64");
   const makeProbeOverride = (mode: string, pidPath: string, ownerPath: string, errorPath: string) => Buffer.from(JSON.stringify([
-    "-NoProfile", "-File", probeScript, mode, "{PORT}", pidPath, ownerPath, errorPath
+    probeScript, mode, "{PORT}", pidPath, ownerPath, errorPath
   ])).toString("base64");
   const scenarios = [
     { mode: "decky", expected: "A DeckyWhatsapp bridge is responding on remote port", notExpected: "could not be identified safely" },
@@ -810,20 +934,27 @@ while ($true) {
       const ownerPath = join(directory, `${scenario.mode}-owner.txt`);
       const errorPath = join(directory, `${scenario.mode}-probe-error.txt`);
       const probeOverride = scenario.mode === "unknown" ? Buffer.from(JSON.stringify(["-NoProfile", "-Command", "exit 255"])).toString("base64") : makeProbeOverride(scenario.mode, pidPath, ownerPath, errorPath);
-      const startedAt = Date.now();
       const child = spawn(powershell, [
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
         "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port),
         "-RecoveryDelaySeconds", "1",
-        "-SshExecutable", powershell, "-SshArgumentsOverrideBase64", failureOverride,
+        "-SshExecutable", process.execPath, "-SshArgumentsOverrideBase64", failureOverride,
         "-DiagnosticProbeOverrideBase64", probeOverride
       ], { stdio: ["pipe", "pipe", "pipe"] });
       supervisors.push(child);
       const output = watchOutput(child);
-      try { await output.waitFor(scenario.expected); }
+      if (scenario.mode === "oversized" || scenario.mode === "streaming") {
+        await waitForFile(pidPath, WINDOWS_NESTED_PROCESS_WAIT_MS, child);
+        await waitForFileContent(ownerPath, "existing-Deck-service", WINDOWS_NESTED_PROCESS_WAIT_MS, child);
+      }
+      const startedAt = Date.now();
+      try {
+        await output.waitFor(scenario.expected, WINDOWS_NESTED_PROCESS_WAIT_MS);
+      }
       catch (error) { throw new Error(`${String(error)}\nMock probe error: ${await readFile(errorPath, "utf8").catch(() => "none")}`); }
       if (scenario.mode === "oversized" || scenario.mode === "streaming") {
-        assert.ok(Date.now() - startedAt < 7000, `${scenario.mode} HTTP bodies must not delay the conflict diagnostic`);
+        assert.ok(Date.now() - startedAt < 7000,
+          `${scenario.mode} response read should finish within its bounded request/read timeout plus scheduling slack`);
       }
       assert.doesNotMatch(output.output, new RegExp(scenario.notExpected));
       if (scenario.mode === "decky" || scenario.mode === "other") {
@@ -842,21 +973,21 @@ while ($true) {
       if (scenario.mode === "unknown") assert.match(output.output, /making one non-interactive SSH forwarding retry/);
     }
   } finally {
-    for (const child of supervisors) if (child.exitCode === null) child.stdin.write("\r\n");
+    for (const child of supervisors) acknowledgeChild(child);
     await Promise.all(supervisors.map(async (child) => {
-      if (child.exitCode !== null) return;
+      if (!isChildRunning(child)) return;
       const exited = Promise.race([
         once(child, "close").then(() => true),
         new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1500))
       ]);
-      if (!(await exited) && child.exitCode === null) child.kill();
+      if (!(await exited) && isChildRunning(child)) await stopOwnedChild(child);
     }));
     await new Promise<void>((resolve) => bridge.close(() => resolve()));
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("simultaneous tunnel startups choose one winner and a reconnect cannot displace it", { timeout: 20_000 }, async (t) => {
+test("simultaneous tunnel startups choose one winner and a reconnect cannot displace it", { timeout: 90_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const bridge = createServer();
@@ -906,8 +1037,8 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   t.after(async () => {
     await writeFile(reconnectGate, "release").catch(() => {});
     await closeBridge();
-    for (const { child } of children) if (child.exitCode === null) child.stdin.write("\r\n");
-    await Promise.all(children.map(({ child }) => child.exitCode !== null ? Promise.resolve() : once(child, "close").then(() => undefined)));
+    for (const { child } of children) acknowledgeChild(child);
+    await Promise.all(children.map(({ child }) => stopOwnedChild(child)));
     await rm(directory, { recursive: true, force: true });
   });
 
@@ -945,18 +1076,18 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   await writeFile(dropSignal, "drop");
   await conflictWinner.winner.output.waitFor("SSH tunnel disconnected. Retrying in 3 seconds...");
   const originalSession = conflictWinner.winner === a ? "A" : "B";
-  await waitForFile(join(spacedDirectory, `${originalSession}-attempt-2.started`));
+  await waitForFile(join(spacedDirectory, `${originalSession}-attempt-2.started`), DEFAULT_FILE_WAIT_MS, conflictWinner.winner.child);
   const c = launchSupervisor("C");
-  await waitForFile(join(spacedDirectory, "C-attempt-1.started"), 10_000);
+  await waitForFile(join(spacedDirectory, "C-attempt-1.started"), WINDOWS_SLOW_RECONNECT_STARTUP_WAIT_MS, c.child);
   try {
-    await waitForFileContent(ownerPath, "C", 10_000);
+    await waitForFileContent(ownerPath, "C", WINDOWS_SLOW_RECONNECT_STARTUP_WAIT_MS, c.child);
   } catch (error) {
     throw new Error(`${String(error)}\nNew session output:\n${c.output.output}\nOriginal session output:\n${conflictWinner.winner.output.output}`);
   }
   assert.equal((await readFile(ownerPath, "utf8")).trim(), "C");
   await writeFile(reconnectGate, "release");
 
-  await conflictWinner.winner.output.waitFor(conflictMessage, 7000);
+  await conflictWinner.winner.output.waitFor(conflictMessage);
   assert.equal(conflictWinner.winner.child.exitCode, null, "the conflict remains visible until acknowledged");
   assert.equal(c.child.exitCode, null, "the reconnecting original did not displace the new winner");
   conflictWinner.winner.child.stdin.write("\r\n");
@@ -979,7 +1110,7 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   ]);
 });
 
-test("two reconnecting supervisors race for an atomic remote-port reservation", { timeout: 20_000 }, async (t) => {
+test("two reconnecting supervisors race for an atomic remote-port reservation", { timeout: 60_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const bridge = createServer();
@@ -1020,8 +1151,8 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   const closeBridge = () => new Promise<void>((resolve) => bridge.close(() => resolve()));
   t.after(async () => {
     await closeBridge();
-    for (const { child } of children) if (child.exitCode === null) child.stdin.write("\r\n");
-    await Promise.all(children.map(({ child }) => child.exitCode !== null ? Promise.resolve() : once(child, "close").then(() => undefined)));
+    for (const { child } of children) acknowledgeChild(child);
+    await Promise.all(children.map(({ child }) => stopOwnedChild(child)));
     await rm(directory, { recursive: true, force: true });
   });
 
@@ -1045,8 +1176,8 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   const a = launchSupervisor("A");
   const b = launchSupervisor("B");
   await Promise.all([
-    waitForFile(join(directory, "A-transient")),
-    waitForFile(join(directory, "B-transient"))
+    waitForFile(join(directory, "A-transient"), WINDOWS_NESTED_PROCESS_WAIT_MS, a.child),
+    waitForFile(join(directory, "B-transient"), WINDOWS_NESTED_PROCESS_WAIT_MS, b.child)
   ]);
   await writeFile(availabilityPath, "available");
 
@@ -1063,10 +1194,10 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   assert.equal((await readFile(ownerPath, "utf8")).trim(), winningSession);
 
   await Promise.all([
-    waitForFile(join(directory, `${winningSession}-attempt-2.started`)),
-    waitForFile(join(directory, `${losingSession}-attempt-2.started`))
+    waitForFile(join(directory, `${winningSession}-attempt-2.started`), DEFAULT_FILE_WAIT_MS, winner.child),
+    waitForFile(join(directory, `${losingSession}-attempt-2.started`), DEFAULT_FILE_WAIT_MS, conflictLoser.child)
   ]);
-  await waitForFile(join(directory, `${losingSession}-attempt-3.started`), 10_000);
+  await waitForFile(join(directory, `${losingSession}-attempt-3.started`), WINDOWS_RECOVERY_STAGE_WAIT_MS, conflictLoser.child);
   conflictLoser.child.stdin.write("\r\n");
   const [loserExitCode] = await once(conflictLoser.child, "close");
   assert.equal(loserExitCode, 1);

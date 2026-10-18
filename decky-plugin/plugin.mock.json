@@ -1,0 +1,13 @@
+{
+  "name": "Decky WhatsApp MOCK",
+  "author": "DeckyWhatsapp",
+  "flags": [],
+  "publish": {
+    "tags": ["testing"],
+    "description": "Offline mock conversations for local UI testing. No WhatsApp or bridge connection is available."
+  },
+  "api_version": 1,
+  "version": "1.0.0",
+  "appkey": "decky-whatsapp-mock",
+  "description": "OFFLINE MOCK ONLY — fabricated local data; no production bridge or account access."
+}

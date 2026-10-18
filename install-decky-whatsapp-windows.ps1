@@ -109,7 +109,26 @@ if (-not (Test-Path -LiteralPath $sshKey -PathType Leaf)) {
 }
 
 if ($InstallDeckKey) {
-    $deckHost = Read-Host "Steam Deck hostname or IP (for example steamdeck.lan)"
+    $suggestedHost = ""
+    $suggestionScript = Join-Path $projectRoot "scripts\suggest-deck-host.mjs"
+    $promptHelper = Join-Path $projectRoot "scripts\deck-host-prompt.ps1"
+    if (Test-Path -LiteralPath $suggestionScript -PathType Leaf) {
+        try {
+            $suggestionOutput = @(& node.exe $suggestionScript 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $suggestionOutput.Count -gt 0) {
+                $suggestedHost = ([string]$suggestionOutput[0]).Trim()
+            }
+        }
+        catch {
+            $suggestedHost = ""
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $promptHelper -PathType Leaf)) {
+        throw "Could not find the Deck address prompt helper at $promptHelper"
+    }
+    . $promptHelper
+    $deckHost = Get-DeckHostPromptResult -SuggestedHost $suggestedHost -ReadInput { param($prompt) Read-Host $prompt }
     if ([string]::IsNullOrWhiteSpace($deckHost)) {
         throw "A Steam Deck hostname or IP is required when -InstallDeckKey is used."
     }

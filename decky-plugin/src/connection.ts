@@ -8,35 +8,8 @@ type SocketOptions = {
   retryDelay?: number;
 };
 
-// Coalesce overlapping refresh triggers without dropping the one that arrives
-// while the current request is still settling.
-export function createQueuedRequest(request: () => Promise<void>): () => Promise<void> {
-  let running = false;
-  let queued = false;
-
-  return async () => {
-    if (running) {
-      queued = true;
-      return;
-    }
-    running = true;
-    let lastError: { value: unknown } | undefined;
-    try {
-      do {
-        queued = false;
-        try {
-          await request();
-          lastError = undefined;
-        } catch (error) {
-          lastError = { value: error };
-        }
-      } while (queued);
-    } finally {
-      running = false;
-    }
-    if (lastError) throw lastError.value;
-  };
-}
+// Keep the historical helper import path for existing tests and callers.
+export { createQueuedRequest, createRevisionGuard } from "./sync-helpers";
 
 // Both the panel and notifications must survive a bridge restart, and must
 // not open a late socket after their owner has stopped/unmounted.
