@@ -3,118 +3,24 @@ import qrcode from "qrcode";
 import qrcodeTerminal from "qrcode-terminal";
 import pkg from "whatsapp-web.js";
 import type { BridgeEvent, BridgeStatus, ChatSummary, IncomingMessage } from "./types.js";
+import { normalizeDownloadedMedia } from "./whatsapp/media.js";
+import {
+  formatMessageBody,
+  getMediaKind,
+  getMessageAck,
+  getMessageId,
+  getMessageKeyDetails,
+  isViewOnceMessage,
+  type RuntimeMessage,
+  type RuntimeReaction,
+  type RuntimeReactionEvent
+} from "./whatsapp/runtime.js";
+
+export { isViewOnceMessage } from "./whatsapp/runtime.js";
 
 const { Client, LocalAuth } = pkg;
-
-type RuntimeMessageId = {
-  _serialized?: unknown;
-  $1?: unknown;
-  remote?: unknown;
-  id?: unknown;
-};
-
-type RuntimeReaction = {
-  aggregateEmoji?: unknown;
-  hasReactionByMe?: boolean;
-  senders?: Array<{ senderUserJid?: unknown; senderId?: unknown }>;
-};
-
-type RuntimeMessage = {
-  id?: RuntimeMessageId | string;
-  from: string;
-  author?: string;
-  fromMe: boolean;
-  ack?: unknown;
-  delete: (deleteForEveryone?: boolean) => Promise<void>;
-  timestamp: number;
-  body?: string;
-  type?: string;
-  hasMedia?: boolean;
-  isGif?: boolean;
-  isViewOnce?: unknown;
-  isViewOnceV2?: unknown;
-  _data?: Record<string, unknown> & {
-    thumbnail?: string;
-    mimetype?: string;
-    isGif?: boolean;
-    isViewOnce?: unknown;
-    isViewOnceV2?: unknown;
-  };
-  getChat: () => Promise<{ id: { _serialized: string; user?: string }; name?: string }>;
-  getContact: () => Promise<{ name?: string; pushname?: string; shortName?: string; verifiedName?: string }>;
-  downloadMedia: () => Promise<{ mimetype: string; data: string; filename?: string | null } | null | undefined>;
-};
-
-function getMessageAck(message: { ack?: unknown; _data?: Record<string, unknown> & { ack?: unknown } }): number | undefined {
-  const value = message.ack ?? message._data?.ack;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
-  return undefined;
-}
-
-type RuntimeReactionEvent = {
-  msgId?: RuntimeMessageId | string;
-  reaction?: unknown;
-  senderId?: unknown;
-};
-
-function formatMessageBody(
-  message: { body?: unknown; type?: unknown; fromMe?: unknown },
-  media?: IncomingMessage["media"],
-  viewOnce = false
-): string {
-  const type = typeof message.type === "string" ? message.type : "";
-  if (type === "revoked") return "[Message deleted]";
-  if (type === "call_log" || type === "call") {
-    return message.fromMe === true ? "[Outgoing call]" : "[Incoming call]";
-  }
-
-  if (viewOnce) {
-    return typeof message.body === "string" && message.body.trim() ? message.body : "[View-once media]";
-  }
-
-  const mediaKind = media?.kind || getMediaKind(message);
-  if (mediaKind) {
-    if (typeof message.body === "string" && message.body.trim()) return message.body;
-    return `[${mediaKind === "sticker" ? "Sticker" : mediaKind === "gif" ? "GIF" : mediaKind === "audio" ? "Voice message" : "Image"}]`;
-  }
-
-  if (typeof message.body === "string" && message.body.trim()) return message.body;
-  return "[System message]";
-}
-
-export function isViewOnceMessage(message: unknown): boolean {
-  if (!message || typeof message !== "object") return false;
-  const runtimeMessage = message as {
-    isViewOnce?: unknown;
-    isViewOnceV2?: unknown;
-    _data?: { isViewOnce?: unknown; isViewOnceV2?: unknown };
-  };
-  return runtimeMessage.isViewOnce === true || runtimeMessage.isViewOnceV2 === true
-    || runtimeMessage._data?.isViewOnce === true || runtimeMessage._data?.isViewOnceV2 === true;
-}
-
-function getMediaKind(message: { type?: unknown; isGif?: unknown; _data?: { isGif?: unknown } }): NonNullable<IncomingMessage["media"]>["kind"] | undefined {
-  const type = typeof message.type === "string" ? message.type : "";
-  if (type === "sticker") return "sticker";
-  if (type === "gif" || (type === "video" && (message.isGif === true || message._data?.isGif === true))) return "gif";
-  if (type.startsWith("image")) return "image";
-  if (type === "audio" || type === "ptt") return "audio";
-  return undefined;
-}
-
-function getMessageId(message: { id?: RuntimeMessageId | string }, fallback: string): string {
-  const id = message.id;
-  if (typeof id === "string" && id) return id;
-  if (!id || typeof id === "string") return fallback;
-  if (typeof id._serialized === "string" && id._serialized) return id._serialized;
-  if (typeof id.$1 === "string" && id.$1) return id.$1;
-  if (typeof id.remote === "string" && typeof id.id === "string") {
-    return `${id.remote}_${id.id}`;
-  }
-  console.warn("[whatsapp] message has no serialized ID", { fallback, idKeys: id && typeof id === "object" ? Object.keys(id) : typeof id });
-  return fallback;
-}
+const MAX_PROFILE_PIC_CACHE_ENTRIES = 50;
+const MAX_PROFILE_PIC_CACHE_BYTES = 32 * 1024 * 1024;
 
 export function getChromiumSandboxArgs(platform: NodeJS.Platform = process.platform): string[] {
   // The tested Ubuntu environment cannot start Chromium with its default sandbox; Windows keeps Chromium's default sandbox.
@@ -138,6 +44,7 @@ export class WhatsAppService {
   private readonly reactionCache = new Map<string, string>();
   private readonly contactNameCache = new Map<string, string>();
   private readonly profilePicCache = new Map<string, string | null>();
+  private profilePicCacheBytes = 0;
   private readonly mediaCache = new Map<string, NonNullable<IncomingMessage["media"]>>();
   private readonly mediaRequests = new Map<string, Promise<IncomingMessage["media"]>>();
   private mediaCacheBytes = 0;
@@ -231,25 +138,39 @@ export class WhatsAppService {
 
     this.client.on("message_reaction", (reaction) => {
       const event = reaction as unknown as RuntimeReactionEvent;
-      const messageId = getMessageId({ id: event.msgId }, "");
-      if (!messageId) return;
       const messageKey = event.msgId;
-      const chatId = typeof messageKey === "object" && messageKey && typeof messageKey.remote === "string"
-        ? messageKey.remote
-        : "";
+      if (!messageKey) return;
+      const messageId = getMessageId({ id: messageKey }, "");
+      if (!messageId) return;
+      const messageKeyDetails = getMessageKeyDetails(messageKey);
+      const chatId = messageKeyDetails.remote || "";
       if (!chatId) return;
-      const senderId = typeof event.senderId === "string"
-        ? event.senderId
-        : event.senderId && typeof event.senderId === "object" && "_serialized" in event.senderId
-          ? String((event.senderId as { _serialized?: unknown })._serialized || "")
-          : "";
-      const ownWid = this.client.info?.wid?._serialized;
+      const getSerializedId = (value: unknown): string => {
+        if (typeof value === "string") return value;
+        if (!value || typeof value !== "object") return "";
+        const id = value as { _serialized?: unknown; $1?: unknown };
+        return typeof id._serialized === "string" ? id._serialized : typeof id.$1 === "string" ? id.$1 : "";
+      };
+      const senderId = getSerializedId(event.senderId);
+      const ownWid = getSerializedId(this.client.info?.wid);
+      const reactionId = getMessageId({ id: event.id }, "");
+      const reactionKeyDetails = event.id ? getMessageKeyDetails(event.id) : {};
+      // The reaction key still identifies self-reactions when the library omits senderId.
+      const actorIsMe = senderId && ownWid
+        ? senderId === ownWid
+        : reactionKeyDetails.fromMe;
+      const parentFromMe = messageKeyDetails.fromMe;
       this.emit({
         type: "reaction",
         chatId,
         messageId,
         emoji: typeof event.reaction === "string" ? event.reaction : "",
-        fromMe: typeof ownWid === "string" && senderId === ownWid
+        fromMe: actorIsMe === true,
+        ...(reactionId ? { reactionId } : {}),
+        ...(senderId ? { actorId: senderId } : {}),
+        ...(actorIsMe !== undefined ? { actorIsMe } : {}),
+        ...(parentFromMe !== undefined ? { parentFromMe } : {}),
+        ...(typeof event.timestamp === "number" ? { timestamp: event.timestamp } : {})
       });
     });
   }
@@ -399,12 +320,17 @@ export class WhatsAppService {
 
   async getProfilePicUrl(chatId: string): Promise<string | undefined> {
     if (this.status !== "ready") throw new Error("WhatsApp is not ready");
-    if (this.profilePicCache.has(chatId)) return this.profilePicCache.get(chatId) || undefined;
+    if (this.profilePicCache.has(chatId)) {
+      const cached = this.profilePicCache.get(chatId) ?? null;
+      this.profilePicCache.delete(chatId);
+      this.profilePicCache.set(chatId, cached);
+      return cached || undefined;
+    }
     try {
       console.log(`[profile] requesting profile picture for ${chatId}`);
       const profilePicUrl = await this.client.getProfilePicUrl(chatId);
       if (!profilePicUrl) {
-        this.profilePicCache.set(chatId, null);
+        this.cacheProfilePic(chatId, null);
         console.log(`[profile] ${chatId}: none`);
         return undefined;
       }
@@ -417,12 +343,29 @@ export class WhatsAppService {
       if (imageData.length === 0 || imageData.length > 2_000_000) throw new Error("profile image size is invalid");
 
       const dataUrl = `data:${contentType};base64,${imageData.toString("base64")}`;
-      this.profilePicCache.set(chatId, dataUrl);
+      this.cacheProfilePic(chatId, dataUrl);
       console.log(`[profile] ${chatId}: received`, { contentType, bytes: imageData.length });
       return dataUrl;
     } catch (error) {
       console.warn("[profile] profile picture lookup failed");
       throw error;
+    }
+  }
+
+  private cacheProfilePic(chatId: string, dataUrl: string | null): void {
+    const weight = (value: string | null): number => value === null ? 0 : value.length * 2;
+    const previous = this.profilePicCache.get(chatId);
+    if (this.profilePicCache.has(chatId)) this.profilePicCacheBytes -= weight(previous ?? null);
+    this.profilePicCache.delete(chatId);
+    this.profilePicCache.set(chatId, dataUrl);
+    this.profilePicCacheBytes += weight(dataUrl);
+
+    while (this.profilePicCache.size > MAX_PROFILE_PIC_CACHE_ENTRIES || this.profilePicCacheBytes > MAX_PROFILE_PIC_CACHE_BYTES) {
+      const oldestChatId = this.profilePicCache.keys().next().value;
+      if (oldestChatId === undefined) break;
+      const oldest = this.profilePicCache.get(oldestChatId);
+      this.profilePicCache.delete(oldestChatId);
+      this.profilePicCacheBytes -= weight(oldest ?? null);
     }
   }
 
@@ -737,7 +680,8 @@ export class WhatsAppService {
     const isGif = message.type === "gif" || (message.type === "video" && (message.isGif === true || message._data?.isGif === true));
     const isImage = message.type?.startsWith("image") === true;
     const isAudio = message.type === "audio" || message.type === "ptt";
-    if (!message.hasMedia || (!isImage && !isSticker && !isGif && !isAudio)) return undefined;
+    const isVideo = getMediaKind(message) === "video";
+    if (!message.hasMedia || (!isImage && !isSticker && !isGif && !isAudio && !isVideo)) return undefined;
 
     const mediaInfo = {
       id: getMessageId(message, "unknown"),
@@ -748,7 +692,7 @@ export class WhatsAppService {
       thumbnailLength: typeof message._data?.thumbnail === "string" ? message._data.thumbnail.length : 0,
       mimetype: message._data?.mimetype || "unknown"
     };
-    const kind = isSticker ? "sticker" : isGif ? "gif" : isAudio ? "audio" : "image";
+    const kind = isSticker ? "sticker" : isGif ? "gif" : isAudio ? "audio" : isVideo ? "video" : "image";
     console.log("[media] media received", JSON.stringify({ ...mediaInfo, kind }));
 
     const thumbnail = message._data?.thumbnail;
@@ -770,14 +714,7 @@ export class WhatsAppService {
         return undefined;
       }
       console.log("[media] full media received", JSON.stringify({ id: mediaInfo.id, mimetype: media.mimetype, base64Length: media.data.length, kind }));
-      const supported = media.mimetype.startsWith("image/") || media.mimetype.startsWith("audio/") || (kind === "gif" && media.mimetype.startsWith("video/"));
-      if (!supported || media.data.length > 12_000_000) return undefined;
-      return {
-        dataUrl: `data:${media.mimetype};base64,${media.data}`,
-        filename: media.filename || undefined,
-        kind,
-        mimetype: media.mimetype
-      };
+      return normalizeDownloadedMedia(media, kind);
     } catch {
       console.error("[media] full media download failed");
       return undefined;

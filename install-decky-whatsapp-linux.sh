@@ -16,28 +16,8 @@ fail() {
 
 [[ -r "${PROJECT_DIR}/scripts/launcher-validation.sh" ]] || fail "Missing shared launcher validation helper under ${PROJECT_DIR}/scripts. Re-extract the complete Linux package and retry."
 source "${PROJECT_DIR}/scripts/launcher-validation.sh"
-
-save_deck_host() {
-  local config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  local config_dir="${config_home}/decky-whatsapp"
-  local host_file="${config_dir}/deck-host"
-  local temporary_file
-  [[ "${config_home}" == /* ]] || fail "XDG_CONFIG_HOME must be an absolute path to save the Deck address safely."
-  if [[ -e "${config_dir}" || -L "${config_dir}" ]]; then
-    [[ -d "${config_dir}" && ! -L "${config_dir}" ]] || fail "DeckyWhatsapp config path is not a real directory: ${config_dir}"
-    [[ "$(stat -c '%u' -- "${config_dir}")" == "${EUID}" ]] || fail "DeckyWhatsapp config directory is not owned by this user: ${config_dir}"
-  else
-    mkdir -p -- "${config_dir}" || fail "Could not create user config directory: ${config_dir}"
-  fi
-  chmod 700 -- "${config_dir}" || fail "Could not restrict permissions on ${config_dir}"
-  [[ ! -d "${host_file}" ]] || fail "Deck address config path is a directory: ${host_file}"
-  temporary_file="$(mktemp "${config_dir}/.deck-host.XXXXXX")" || fail "Could not create a temporary Deck address config."
-  chmod 600 -- "${temporary_file}" || { rm -f -- "${temporary_file}"; fail "Could not restrict permissions on temporary Deck config."; }
-  if ! printf '%s\n' "${deck_host}" > "${temporary_file}" || ! mv -f -- "${temporary_file}" "${host_file}"; then
-    rm -f -- "${temporary_file}"
-    fail "Could not save the Deck address to ${host_file}."
-  fi
-}
+[[ -r "${PROJECT_DIR}/scripts/linux-deck-host-config.sh" ]] || fail "Missing shared Deck address config helper under ${PROJECT_DIR}/scripts. Re-extract the complete Linux package and retry."
+source "${PROJECT_DIR}/scripts/linux-deck-host-config.sh"
 
 note() {
   printf '\n%s\n' "$*"
@@ -224,7 +204,7 @@ else
   read -r -p "No known Steam Deck hostname resolved. Enter the Steam Deck hostname or IPv4 address manually: " deck_host
 fi
 valid_deck_host "${deck_host}" || fail "Invalid hostname/address '${deck_host}'. Use a DNS hostname or IPv4 address without spaces, ports, or SSH options."
-save_deck_host
+save_deck_host_config "${deck_host}"
 note "Saved the Deck address in this user's private config. Later launches reuse it; override once with DECK_HOST or --deck-host, or change it with --configure-deck-host."
 remote="${DECK_USER}@${deck_host}"
 note "Checking SSH connectivity to ${remote}. The SSH client may ask you to trust the Deck host key or enter the Deck account password."

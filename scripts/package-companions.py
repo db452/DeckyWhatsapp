@@ -26,9 +26,15 @@ COMMON_FILES = (
     "src/server.ts",
     "src/types.ts",
     "src/whatsapp.ts",
+    "src/whatsapp/media.ts",
+    "src/whatsapp/runtime.ts",
     "patches/whatsapp-web.js+1.34.7.patch",
+    "docs/ARCHITECTURE.md",
+    "docs/DEVELOPMENT.md",
+    "docs/LINUX.md",
     "docs/SECURITY.md",
     "docs/THIRD-PARTY-NOTICES.md",
+    "docs/WINDOWS.md",
 )
 PLATFORMS = {
     "windows": {
@@ -45,11 +51,12 @@ PLATFORMS = {
     "linux": {
         "archive_prefix": "decky-whatsapp-pc-linux-v",
         "files": COMMON_FILES + (
-            "docs/LINUX.md",
             "install-decky-whatsapp-linux.sh",
             "start-decky-whatsapp-linux.sh",
             "keep-ssh-tunnel.sh",
             "scripts/launcher-validation.sh",
+            "scripts/linux-bridge-helper.mjs",
+            "scripts/linux-deck-host-config.sh",
         ),
         "executables": {
             "install-decky-whatsapp-linux.sh",

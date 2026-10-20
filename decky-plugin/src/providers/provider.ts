@@ -1,5 +1,5 @@
-import type { ChatSummary } from "./types/chat";
-import type { IncomingMessage } from "./types/message";
+import type { ChatSummary } from "../types/chat";
+import type { IncomingMessage } from "../types/message";
 
 export type BridgeStatus = "starting" | "qr_required" | "authenticated" | "ready" | "disconnected" | "auth_failure" | "disabled" | "unknown";
 export type BridgeEvent =
@@ -7,7 +7,18 @@ export type BridgeEvent =
   | { type: "message"; message: IncomingMessage }
   | { type: "message_update"; update: "edited" | "deleted"; message: IncomingMessage }
   | { type: "message_ack"; chatId: string; messageId: string; ack: number }
-  | { type: "reaction"; chatId: string; messageId: string; emoji: string; fromMe: boolean };
+  | {
+      type: "reaction";
+      chatId: string;
+      messageId: string;
+      emoji: string;
+      fromMe: boolean;
+      reactionId?: string;
+      actorId?: string;
+      actorIsMe?: boolean;
+      parentFromMe?: boolean;
+      timestamp?: number;
+    };
 
 export type Operation = "chats" | "health" | "profile" | "history" | "read" | "send" | "delete" | "react";
 export type OperationPayload = {
@@ -41,6 +52,7 @@ export interface DataProvider {
   transcribe(audioBase64: string): Promise<string>;
   editMockMessage(chatId: string, messageId: string, body: string): Promise<boolean>;
   simulateIncoming(): void;
+  simulateReaction(): void;
   switchSession(): void;
   simulateDelay(milliseconds: number): void;
   simulateSendFailure(): void;

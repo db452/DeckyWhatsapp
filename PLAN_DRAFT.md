@@ -26,7 +26,7 @@ The October 16, 2026 source snapshot contains:
 
 - `src/whatsapp.ts`: a WhatsApp client based on `whatsapp-web.js` and Puppeteer/Chromium, currently hosted on a companion computer.
 - `src/server.ts` and `src/types.ts`: an Express/WebSocket loopback bridge, health/status reporting, QR events, message/chat endpoints and shared message/event structures.
-- `decky-plugin/src/index.tsx` and `decky-plugin/src/connection.ts`: the Decky frontend, notifications, conversation handling, controller interaction and bridge reconnection.
+- `decky-plugin/src/index.tsx` and `decky-plugin/src/connection/connection.ts`: the Decky frontend, notifications, conversation handling, controller interaction and bridge reconnection.
 - `decky-plugin/main.py`: an existing Python Decky backend currently used for optional local Whisper transcription; its `_main` and `_unload` do not supervise a messaging process yet.
 - Existing Windows/Linux launchers and SSH tunnel supervision, which standalone operation should no longer require.
 

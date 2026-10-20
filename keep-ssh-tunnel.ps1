@@ -6,6 +6,7 @@ param(
     [int]$BridgeProcessId = 0,
     [long]$BridgeStartTimeUtcTicks = 0,
     [ValidateRange(1, 300)] [int]$RecoveryDelaySeconds = 60,
+    [ValidateRange(1, 300)] [int]$RecoveryWindowSeconds = 90,
     [string]$IdentityFile = "",
     [string]$SshExecutable = "ssh.exe",
     [switch]$NonInteractive,
@@ -21,6 +22,7 @@ $sshArguments = @(
     "-o", "ServerAliveInterval=15",
     "-o", "ServerAliveCountMax=3",
     "-o", "TCPKeepAlive=yes",
+    "-o", "ConnectTimeout=10",
     "-o", "ExitOnForwardFailure=yes",
     "-R", $remoteForward
 )
@@ -266,6 +268,8 @@ $canSafelyRetryStaleForward = $BridgeProcessId -gt 0 -and $BridgeStartTimeUtcTic
 $staleRecoveryAttempted = $false
 $staleRecoveryRetryPending = $false
 $staleRecoveryForwardEstablished = $false
+$staleRecoveryDeadline = [DateTime]::MinValue
+$hasAttemptedAuthentication = $NonInteractive.IsPresent
 
 while ($true) {
     if (-not (Test-BridgeListening)) {
@@ -276,6 +280,9 @@ while ($true) {
     $stdoutPath = Join-Path $env:TEMP ("decky-whatsapp-ssh-" + [guid]::NewGuid().ToString("N") + ".out")
     $stderrPath = Join-Path $env:TEMP ("decky-whatsapp-ssh-" + [guid]::NewGuid().ToString("N") + ".err")
     $currentSshArguments = $sshArguments
+    if ($hasAttemptedAuthentication -and -not $staleRecoveryRetryPending -and -not $SshArgumentsOverrideBase64) {
+        $currentSshArguments = @("-o", "BatchMode=yes") + $currentSshArguments
+    }
     $isStaleRecoveryRetry = $staleRecoveryRetryPending
     if ($staleRecoveryRetryPending) {
         # Capture OpenSSH's positive bind confirmation without allowing another prompt.
@@ -288,6 +295,7 @@ while ($true) {
     try {
         Write-Host "Starting SSH tunnel to $remote..."
         $sshProcess = Start-Process -FilePath $SshExecutable -ArgumentList $arguments -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        $hasAttemptedAuthentication = $true
 
         while (-not $sshProcess.HasExited) {
             if (-not (Test-BridgeListening)) {
@@ -315,14 +323,26 @@ while ($true) {
         }
 
         if ($isStaleRecoveryRetry -and -not $staleRecoveryForwardEstablished) {
-            if ($sshOutput) { $sshOutput | ForEach-Object { Write-Host $_ } }
             if (-not (Test-BridgeListening)) {
                 Write-Host "The PC bridge is no longer running. Closing after the stale-port retry."
                 exit 0
             }
             if ($sshText -match '(?i)(permission denied|authentication failed|no more authentication methods|too many authentication failures|passphrase)') {
+                if ($sshOutput) { $sshOutput | ForEach-Object { Write-Host $_ } }
                 Write-Host "The one-time stale-port retry could not authenticate without prompting. Password-only SSH or a key that requires an unavailable passphrase cannot recover automatically. Confirm SSH authentication, then manually restart the launcher."
+                Write-Host "The launcher is stopping without prompting or retrying again. It will not stop remote processes."
+                exit 1
+            } elseif ($sshText -match '(?i)(administratively prohibited|remote forwarding.*disabled)') {
+                if ($sshOutput) { $sshOutput | ForEach-Object { Write-Host $_ } }
+                Write-Host "The SSH server denied remote forwarding by policy. Ask the Deck administrator to allow forwarding; no automatic retry was made."
+                exit 1
+            } elseif ([DateTime]::UtcNow -lt $staleRecoveryDeadline) {
+                Write-Host "OpenSSH did not confirm the remote forward yet. Retrying in 5 seconds within the bounded stale-port recovery window."
+                Start-Sleep -Seconds 5
+                $staleRecoveryRetryPending = $true
+                continue
             } else {
+                if ($sshOutput) { $sshOutput | ForEach-Object { Write-Host $_ } }
                 Write-Host "The one-time non-interactive stale-port retry ended with SSH exit code $($sshExitCode). The port may still be occupied, or SSH may have a transport, host-key, or other connection error. Review the SSH output, confirm the Deck keepalive setting and connection, then restart the launcher manually."
             }
             Write-Host "The launcher is stopping without prompting or retrying again. It will not stop remote processes."
@@ -331,6 +351,13 @@ while ($true) {
 
         if ($isStaleRecoveryRetry -and $staleRecoveryForwardEstablished) {
             $sshOutput = @($sshOutput | Where-Object { $_ -notmatch '^\s*debug1:' })
+        }
+
+        if ($sshExitCode -ne 0 -and $sshText -match '(?i)(permission denied|authentication failed|no more authentication methods|too many authentication failures|passphrase)') {
+            if ($sshOutput) { $sshOutput | ForEach-Object { Write-Host $_ } }
+            Write-Host "SSH authentication failed during an automatic reconnect. BatchMode will not prompt for a password or unavailable key passphrase; confirm SSH authentication, then restart the launcher manually."
+            if (-not $NonInteractive) { Read-Host "Press Enter to close this window" }
+            exit 1
         }
 
         if ($sshExitCode -ne 0 -and $sshText -match '(?i)(remote port forwarding failed|cannot listen to port|address already in use|administratively prohibited)') {
@@ -347,6 +374,7 @@ while ($true) {
                 } else {
                     Write-Host "The port may be held by an unresponsive or stale tunnel, a non-HTTP service, or SSH forwarding may be restricted. The owner could not be identified safely."
                     if (-not $staleRecoveryAttempted -and $canSafelyRetryStaleForward) {
+                        $staleRecoveryDeadline = [DateTime]::UtcNow.AddSeconds($RecoveryWindowSeconds)
                         Write-Host "Waiting up to $RecoveryDelaySeconds seconds for the Deck SSH server to expire an unresponsive client. No remote process will be stopped."
                         $recoveryDeadline = [DateTime]::UtcNow.AddSeconds($RecoveryDelaySeconds)
                         while ([DateTime]::UtcNow -lt $recoveryDeadline) {
@@ -363,7 +391,7 @@ while ($true) {
                         }
                         $staleRecoveryAttempted = $true
                         $staleRecoveryRetryPending = $true
-                        Write-Host "The same local bridge process is still active; making one non-interactive SSH forwarding retry."
+                        Write-Host "The same local bridge process is still active; starting non-interactive SSH retries within the bounded recovery window."
                         continue
                     }
                     if (-not $canSafelyRetryStaleForward) {
@@ -382,6 +410,13 @@ while ($true) {
         if (-not (Test-BridgeListening)) {
             Write-Host "The PC bridge is no longer running. Closing the SSH tunnel."
             exit 0
+        }
+
+        if ($staleRecoveryForwardEstablished) {
+            # A confirmed recovered connection earns a new bounded recovery
+            # allowance if a later suspend leaves another stale remote forward.
+            $staleRecoveryAttempted = $false
+            $staleRecoveryForwardEstablished = $false
         }
 
         Write-Host "SSH tunnel disconnected. Retrying in 3 seconds..."

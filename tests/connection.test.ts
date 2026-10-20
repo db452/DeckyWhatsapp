@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 import { setImmediate } from "node:timers/promises";
-import { connectSocket, createQueuedRequest, createRevisionGuard, fetchWithTimeout } from "../decky-plugin/src/connection.ts";
+import { connectSocket, createQueuedRequest, createRevisionGuard, fetchWithTimeout } from "../decky-plugin/src/connection/connection.ts";
 
 test("a stale contact snapshot is rejected after a newer live event", () => {
   const revision = createRevisionGuard();
@@ -40,12 +40,13 @@ function fakeSockets(t: TestContext) {
     static instances: Socket[] = [];
     readyState = 0;
     closed = false;
+    emitCloseOnClose = true;
     onopen?: () => void;
     onclose?: () => void;
     onerror?: (error: unknown) => void;
     onmessage?: (event: { data: string }) => void;
     constructor(_url: string) { Socket.instances.push(this); }
-    close() { this.closed = true; this.onclose?.(); }
+    close() { this.closed = true; if (this.emitCloseOnClose) this.onclose?.(); }
   }
   globalThis.WebSocket = Socket as unknown as typeof WebSocket;
   t.after(() => { globalThis.WebSocket = original; });
@@ -128,6 +129,67 @@ test("a closed event socket retries and can reconnect", { timeout: 2000 }, async
   await reconnected;
   assert.equal(Socket.instances.length, 2);
   assert.equal(opened, 2);
+});
+
+test("a long timer gap after suspend replaces the socket when resume notification was missed", async (t) => {
+  const Socket = fakeSockets(t);
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const originalNow = Date.now;
+  let suspendCheck: (() => void) | undefined;
+  let suspendTimerActive = false;
+  let timerCleared = false;
+  let attempts = 0;
+  const messages: string[] = [];
+  globalThis.setInterval = ((callback: TimerHandler) => {
+    suspendCheck = callback as () => void;
+    suspendTimerActive = true;
+    return 123 as unknown as ReturnType<typeof setInterval>;
+  }) as typeof setInterval;
+  globalThis.clearInterval = (() => { suspendTimerActive = false; timerCleared = true; }) as typeof clearInterval;
+  let now = 1_000;
+  Date.now = () => now;
+  t.after(() => {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    Date.now = originalNow;
+  });
+
+  const connection = connectSocket({
+    url: async () => { attempts += 1; return "ws://localhost/events"; },
+    onMessage: (message) => { messages.push(message); },
+    retryDelay: 0
+  });
+  t.after(() => connection.close());
+  await setImmediate();
+  const first = Socket.instances[0];
+  first.readyState = 1;
+  first.onopen?.();
+  first.readyState = 2;
+  first.emitCloseOnClose = false;
+  now += 61_000;
+  suspendCheck?.();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(first.closed, true);
+  assert.equal(Socket.instances.length, 2);
+  const second = Socket.instances[1];
+  second.readyState = 1;
+  second.onopen?.();
+  first.onmessage?.({ data: "stale" });
+  first.onopen?.();
+  first.onerror?.(new Error("stale socket error"));
+  first.onclose?.();
+  assert.deepEqual(messages, [], "callbacks from the replaced socket must be ignored");
+  assert.equal(Socket.instances.length, 2, "stale close and error callbacks must not schedule another socket");
+  assert.equal(attempts, 2);
+  connection.close();
+  now += 61_000;
+  suspendCheck?.();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(timerCleared, true, "closing the owner must cancel the periodic suspend check");
+  assert.equal(suspendTimerActive, false);
+  assert.equal(Socket.instances.length, 2, "a saved timer callback after cleanup must not reconnect");
+  assert.equal(attempts, 2);
 });
 
 test("fetch timeout aborts a stalled request", async (t) => {

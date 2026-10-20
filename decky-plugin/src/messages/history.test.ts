@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { getHistoryExpansionFocusId, getNextHistoryLimit, HistoryRequestLifecycle, mergeHistorySnapshot, RecentLiveMessageCache } from "./history";
-import type { IncomingMessage } from "./types/message";
+import type { IncomingMessage } from "../types/message";
 
 function message(id: string, timestamp: number, chatId = "chat"): IncomingMessage {
   return { id, chatId, chatName: "Chat", sender: "You", body: id, timestamp, fromMe: true };

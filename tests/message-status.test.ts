@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { getMessageStatus } from "../decky-plugin/src/message-status.ts";
+import { getMessageStatus } from "../decky-plugin/src/messages/message-status.ts";
 
 test("outgoing message acknowledgements map to the expected visible status", () => {
   assert.equal(getMessageStatus(1).label, "Sent");

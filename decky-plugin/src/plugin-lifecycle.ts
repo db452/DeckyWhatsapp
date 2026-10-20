@@ -1,5 +1,5 @@
-import { registerOnResumeFromSuspend } from "./steam-compat";
-import type { SteamListenerNamespace } from "./steam-compat";
+import { registerOnResumeFromSuspend } from "./platform/steam-compat";
+import type { SteamListenerNamespace } from "./platform/steam-compat";
 
 type PluginDescriptor = { onDismount?: () => void };
 

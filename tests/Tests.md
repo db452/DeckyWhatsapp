@@ -1,6 +1,6 @@
 # Automated test guide
 
-This guide describes each test file included by the root `npm test` script in `package.json`. The script currently includes **112 tests across 15 files**. Tests may be skipped on platforms they do not target, especially the Windows PowerShell tests.
+This guide describes each test file included by the root `npm test` script in `package.json`. The script currently includes **117 tests across 16 files**. Tests may be skipped on platforms they do not target, especially the Windows PowerShell tests.
 
 Run the full root suite with:
 
@@ -41,7 +41,7 @@ The tests use mocked WhatsApp clients, local sockets, temporary files, and child
 - **“media download failures do not log exception messages, URLs, or tokens”** — Protects logs from sensitive exception text, media URLs, and token values.
 - **“chat service failures retain fallback behavior without logging exception content”** — Preserves the empty-chat fallback after an error while keeping the error's potentially sensitive contents out of logs.
 
-## `tests/connection.test.ts` — 7 tests
+## `tests/connection.test.ts` — 8 tests
 
 - **“a stale contact snapshot is rejected after a newer live event”** — Ensures an older contact-list response cannot overwrite newer event data.
 - **“a ready-state refresh queues behind a failing initial contacts request”** — Checks that the ready event triggers another contact load even if the initial request fails.
@@ -49,6 +49,7 @@ The tests use mocked WhatsApp clients, local sockets, temporary files, and child
 - **“stopping during bootstrap prevents a late socket from opening”** — Ensures a connection stopped during bootstrap does not create a socket when bootstrap later completes.
 - **“stopping an open socket ignores late events and closes it”** — Confirms shutdown closes the socket and ignores messages delivered afterward.
 - **“a closed event socket retries and can reconnect”** — Checks that a closed WebSocket is replaced by a later connection attempt.
+- **“a long timer gap after suspend replaces the socket when resume notification was missed”** — Confirms a missed Steam resume callback is covered by the low-frequency browser timer-gap check.
 - **“fetch timeout aborts a stalled request”** — Ensures a request that exceeds its deadline is aborted.
 
 ## `tests/connection-state.test.ts` — 5 tests
@@ -74,7 +75,7 @@ The tests use mocked WhatsApp clients, local sockets, temporary files, and child
 - **“remembering a duplicate ID does not move it behind newer IDs”** — Ensures seeing the same notification again does not change which ID will be evicted next.
 - **“notification ID cache requires a positive integer limit”** — Rejects zero, fractional, or otherwise invalid cache limits.
 
-## `decky-plugin/src/history.test.ts` — 8 tests
+## `decky-plugin/src/messages/history.test.ts` — 8 tests
 
 - **“history expansion focuses the older neighbor of its previous oldest boundary”** — Checks that loading more history selects the older neighboring message and advances the requested batch size.
 - **“history expansion stops when exhausted or at the bridge limit”** — Prevents further expansion when history is exhausted, the bridge limit is reached, or no focus target exists.
@@ -85,12 +86,12 @@ The tests use mocked WhatsApp clients, local sockets, temporary files, and child
 - **“adopting a session after live events preserves them and invalidates unknown-session history”** — Keeps valid live events received before the session status frame while rejecting requests tied to an unknown session.
 - **“session refresh loading stays owned by the replacement request”** — Ensures an obsolete request cannot clear the loading indicator for its replacement.
 
-## `decky-plugin/src/view-once.test.ts` — 2 tests
+## `decky-plugin/src/messages/view-once.test.ts` — 2 tests
 
 - **“view-once media gets a clear phone fallback without claiming it was viewed”** — Requires the unsupported-media notice to direct the user to their phone without saying the content was viewed.
 - **“ordinary messages have no view-once notice”** — Ensures normal messages do not show the view-once fallback.
 
-## `decky-plugin/src/message-actions.test.ts` — 4 tests
+## `decky-plugin/src/messages/message-actions.test.ts` — 4 tests
 
 - **“Y has no action for images or unsupported media”** — Keeps ordinary images inline and confirms Y has no action for images, video, GIF, absent media, or empty media.
 - **“Y keeps audio on the existing play/pause action”** — Preserves the existing audio control when Y is pressed on an audio message.
@@ -110,11 +111,13 @@ The tests use mocked WhatsApp clients, local sockets, temporary files, and child
 - **“authenticated legacy shutdown without a body remains supported”** — Protects compatibility with authenticated clients that use the previous shutdown request format.
 - **“a second bridge binding fails without replacing the first active session”** — Confirms a bridge started on an occupied port cannot displace the bridge that already owns it.
 
-## `tests/tunnel.test.ts` — 21 tests
+## `tests/tunnel.test.ts` — 25 tests
 
 - **“Linux SSH log reader drains and captures diagnostics without writing to the terminal”** — Checks the Linux launcher's log reader captures SSH diagnostics while keeping them out of an unexpected terminal output path.
 - **“Linux SSH FIFO keepalive remains open until the SSH writer has exited”** — Prevents premature closure of the Linux SSH log pipe while its writer is still active.
+- **“Linux recovery accepts OpenSSH confirmation, resets after recovery, and stops on auth or policy failures”** — Checks the complete comma-delimited OpenSSH confirmation, a fresh allowance after successful recovery, BatchMode, bounded retries, and auth/policy stop guidance.
 - **“the Linux launcher resolves installer-style symlinks before loading project helpers”** — Ensures the Linux launcher finds its project files when invoked through an installer-created symlink.
+- **“CDP tunnel Start clears metadata only for a valid absent PID and a verified free port”** — Guards stale-state cleanup so unreadable lookups, malformed state, live PIDs, or occupied ports preserve state and processes.
 - **“the Windows launcher refuses a second local bridge without shutting down the active one”** — Protects an already running local bridge when another Windows launcher is started.
 - **“the shared launcher port reader honors environment precedence and normalizes decimal values”** — Checks port selection precedence and normalization of valid decimal port values.
 - **“confirmed bridge shutdown lets Linux and Windows foreground launchers close their owned tunnels”** — Ensures a launcher closes the SSH tunnel it owns after the bridge confirms shutdown, on both platforms.
@@ -123,9 +126,10 @@ The tests use mocked WhatsApp clients, local sockets, temporary files, and child
 - **“normal supervisor exit on a closed bridge port does not wait for input”** — Ensures the supervisor exits without hanging for keyboard input when its bridge has already stopped.
 - **“background supervisor closes its SSH child when the recorded bridge exits even if the port is reused”** — Protects against closing or mistaking a different service that later reuses the bridge port.
 - **“SSH forwarding policy failures show the SSH diagnostic without claiming another bridge is active”** — Keeps forwarding-policy errors distinct from evidence that another DeckyWhatsapp bridge is running.
-- **“an unidentified forwarding conflict gets one delayed, non-interactive retry while the same bridge owns the port”** — Limits recovery to one bounded retry and confirms it stays tied to the same local bridge process.
+- **“an unidentified forwarding conflict retries non-interactively while the same bridge owns the port”** — Limits recovery to its bounded window and confirms retries stay tied to the same local bridge process.
 - **“the stale-port retry stops when BatchMode cannot authenticate instead of prompting or looping”** — Prevents an automated diagnostic retry from prompting for another password or looping when SSH cannot authenticate non-interactively.
 - **“the stale-port retry stops after a transport failure without a third interactive attempt”** — Ensures a transport failure ends bounded retry behavior without starting another interactive SSH attempt.
+- **“Windows supervisor stops after authentication fails on an ordinary BatchMode reconnect”** — Confirms an authentication failure after a transport drop stops the reconnect loop with actionable guidance.
 - **“the stale-port retry stays supervised when SSH connects successfully”** — Checks that a successful retry remains under supervisor control for cleanup.
 - **“a confirmed stale-port retry may reconnect normally after a later transport drop”** — Allows the normal reconnect behavior after a stale-port conflict has been resolved and a later connection drops.
 - **“stale-port recovery does not retry after the original local bridge process is replaced”** — Prevents a retry from acting on a new process that replaced the original local bridge.

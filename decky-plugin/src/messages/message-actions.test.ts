@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createMessageYPressHandler, getMessageYAction } from "./message-actions";
-import type { IncomingMessage } from "./types/message";
+import type { IncomingMessage } from "../types/message";
 
 function makeMessage(media?: IncomingMessage["media"]): IncomingMessage {
   return {
@@ -26,6 +26,12 @@ test("Y has no action for images or unsupported media", () => {
 
 test("Y keeps audio on the existing play/pause action", () => {
   assert.equal(getMessageYAction(makeMessage({ dataUrl: "data:audio/ogg;base64,AA==", kind: "audio", mimetype: "audio/ogg" })), "toggle-audio");
+});
+
+test("Y toggles ordinary video and keeps view-once video unsupported", () => {
+  const video = makeMessage({ dataUrl: "data:video/webm;base64,GkXfo", kind: "video", mimetype: "video/webm" });
+  assert.equal(getMessageYAction(video), "toggle-video");
+  assert.equal(getMessageYAction({ ...video, viewOnce: true }), undefined);
 });
 
 test("one Y press routes to exactly one audio action", () => {

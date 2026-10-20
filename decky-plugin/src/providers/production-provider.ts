@@ -1,5 +1,5 @@
 import { call } from "@decky/api";
-import { connectSocket, fetchWithTimeout } from "./connection";
+import { connectSocket, fetchWithTimeout } from "../connection/connection";
 import type { BridgeEvent, DataProvider, Operation, OperationPayload, ProviderConnection, ProviderResponse } from "./provider";
 
 const storagePrefix = "decky-whatsapp-";
@@ -81,5 +81,5 @@ export const provider: DataProvider = {
   voiceStatus() { return call<[], { available: boolean; reason?: string }>("voice_typing_status"); },
   transcribe(audioBase64) { return call<[string], string>("transcribe_audio", audioBase64); },
   async editMockMessage() { return false; },
-  simulateIncoming() {}, switchSession() {}, simulateDelay() {}, simulateSendFailure() {}, simulateMediaFailure() {}, simulateReconnect() {}, simulateError() {}, reset() {}
+  simulateIncoming() {}, simulateReaction() {}, switchSession() {}, simulateDelay() {}, simulateSendFailure() {}, simulateMediaFailure() {}, simulateReconnect() {}, simulateError() {}, reset() {}
 };

@@ -39,6 +39,60 @@ test("background QR pairing keeps the plugin QR event but suppresses terminal cr
   }
 });
 
+test("reaction bridge events include safe actor, parent, timestamp, and reaction identity fields", () => {
+  const service = new WhatsAppService();
+  const events: import("./types.js").BridgeEvent[] = [];
+  service.onEvent((event) => events.push(event));
+  const client = (service as unknown as { client: { info?: unknown; emit: (name: string, value: unknown) => void } }).client;
+  client.info = { wid: { _serialized: "self@example" } };
+  client.emit("message_reaction", {
+    id: { remote: "group@example", id: "reaction-1", fromMe: false },
+    msgId: { remote: "group@example", id: "own-message-1", fromMe: true },
+    timestamp: 1_797_000_000,
+    reaction: "🌱",
+    senderId: "other@example"
+  });
+
+  assert.deepEqual(events, [{
+    type: "reaction",
+    chatId: "group@example",
+    messageId: "group@example_own-message-1",
+    emoji: "🌱",
+    fromMe: false,
+    reactionId: "group@example_reaction-1",
+    actorId: "other@example",
+    actorIsMe: false,
+    parentFromMe: true,
+    timestamp: 1_797_000_000
+  }]);
+});
+
+test("reaction bridge events recover attribution from WhatsApp's renamed $1 message keys", () => {
+  const service = new WhatsAppService();
+  const events: import("./types.js").BridgeEvent[] = [];
+  service.onEvent((event) => events.push(event));
+  const client = (service as unknown as { client: { info?: unknown; emit: (name: string, value: unknown) => void } }).client;
+  client.info = { wid: { $1: "self@example" } };
+  client.emit("message_reaction", {
+    id: { $1: "false_group@example_reaction-2" },
+    msgId: { $1: "true_group@example_own-message-2" },
+    timestamp: 1_797_000_001,
+    reaction: "👍"
+  });
+
+  assert.deepEqual(events, [{
+    type: "reaction",
+    chatId: "group@example",
+    messageId: "true_group@example_own-message-2",
+    emoji: "👍",
+    fromMe: false,
+    reactionId: "false_group@example_reaction-2",
+    actorIsMe: false,
+    parentFromMe: true,
+    timestamp: 1_797_000_001
+  }]);
+});
+
 function createService() {
   const service = Object.create(WhatsAppService.prototype) as any;
   service.mediaCache = new Map();
@@ -199,6 +253,84 @@ test("view-once history is marked and never attempts a media download", async ()
   assert.equal(downloads, 0);
   assert.equal(history.messages[0].viewOnce, true);
   assert.equal(history.messages[0].body, "[View-once media]");
+  assert.equal(history.messages[0].media, undefined);
+});
+
+test("ordinary incoming videos get a useful fallback and hydrate through history", async () => {
+  const service = createService();
+  service.getSenderName = async () => "Contact";
+  const message = {
+    id: "ordinary-video",
+    from: "chat-1",
+    fromMe: false,
+    timestamp: 120,
+    body: "",
+    type: "video",
+    hasMedia: true,
+    getChat: async () => ({ id: { _serialized: "chat-1" }, name: "Chat" }),
+    downloadMedia: async () => ({ mimetype: "video/mp4; codecs=avc1", data: "AA==", filename: "clip.mp4" })
+  };
+  let event: any;
+  service.onEvent((next: unknown) => { event = next; });
+  await service.publishCreatedMessage(message);
+  assert.equal(event.message.body, "[Video]");
+  assert.equal(event.message.mediaKind, "video");
+
+  service.status = "ready";
+  service.client = { getChatById: async () => ({
+    id: { _serialized: "chat-1" }, name: "Chat", fetchMessages: async () => [message]
+  }) };
+  const history = await service.getChatHistory("chat-1");
+  assert.equal(history.messages[0].body, "[Video]");
+  assert.equal(history.messages[0].mediaKind, "video");
+  assert.deepEqual(history.messages[0].media, {
+    dataUrl: "data:video/mp4;base64,AA==", filename: "clip.mp4", kind: "video", mimetype: "video/mp4"
+  });
+});
+
+test("ordinary video downloads accept browser-supported MIME types and reject unsupported or oversized payloads", async () => {
+  const service = createService();
+  const makeVideo = (mimetype: string, data = "AA==") => ({
+    id: "video", from: "chat-1", fromMe: false, timestamp: 1, type: "video", hasMedia: true,
+    downloadMedia: async () => ({ mimetype, data })
+  });
+  const mp4 = await service.downloadMedia(makeVideo("VIDEO/MP4; codecs=avc1") as any);
+  const webm = await service.downloadMedia(makeVideo("video/webm") as any);
+  const imageMime = await service.downloadMedia(makeVideo("image/jpeg") as any);
+  const audioMime = await service.downloadMedia(makeVideo("audio/ogg") as any);
+  assert.equal(mp4?.kind, "video");
+  assert.equal(mp4?.mimetype, "video/mp4");
+  assert.equal(mp4?.dataUrl, "data:video/mp4;base64,AA==");
+  assert.equal(webm?.mimetype, "video/webm");
+  assert.equal(imageMime, undefined, "video messages must reject an image MIME payload");
+  assert.equal(audioMime, undefined, "video messages must reject an audio MIME payload");
+  assert.equal(await service.downloadMedia(makeVideo("video/quicktime") as any), undefined);
+  assert.equal(await service.downloadMedia(makeVideo("video/mp4", "A".repeat(12_000_001)) as any), undefined);
+
+  const gifMarkedVideo = await service.downloadMedia({
+    ...makeVideo("video/webm"), isGif: true
+  } as any);
+  assert.equal(gifMarkedVideo?.kind, "gif", "WhatsApp video messages marked as GIF retain GIF classification");
+});
+
+test("view-once videos keep the phone fallback and are never downloaded or classified for playback", async () => {
+  const service = createService();
+  let downloads = 0;
+  service.status = "ready";
+  service.getSenderName = async () => "Contact";
+  const viewOnceVideo = {
+    id: "view-once-video", from: "chat-1", fromMe: false, timestamp: 100, body: "", type: "video", hasMedia: true,
+    _data: { isViewOnceV2: true }, downloadMedia: async () => { downloads++; return { mimetype: "video/mp4", data: "AA==" }; }
+  };
+  service.client = { getChatById: async () => ({
+    id: { _serialized: "chat-1" }, name: "Chat", fetchMessages: async () => [viewOnceVideo]
+  }) };
+
+  const history = await service.getChatHistory("chat-1");
+  assert.equal(downloads, 0);
+  assert.equal(history.messages[0].viewOnce, true);
+  assert.equal(history.messages[0].body, "[View-once media]");
+  assert.equal(history.messages[0].mediaKind, undefined);
   assert.equal(history.messages[0].media, undefined);
 });
 

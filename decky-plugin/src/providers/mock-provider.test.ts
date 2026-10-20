@@ -10,7 +10,7 @@ import { Fragment, jsx, jsxs } from "react/jsx-runtime";
 import { act, create } from "react-test-renderer";
 import { provider } from "./mock-provider";
 import { createMockProviderLifecycle } from "./mock-provider-lifecycle";
-import { mergeHistorySnapshot, RecentLiveMessageCache } from "./history";
+import { mergeHistorySnapshot, RecentLiveMessageCache } from "../messages/history";
 
 const repositoryRoot = process.cwd();
 let networkAttempts = 0;
@@ -101,6 +101,31 @@ test("mock notifications are local and subscription cleanup is idempotent", asyn
     second.close();
     provider.simulateIncoming();
     assert.equal(received.length, 3);
+    assert.equal(networkAttempts, 0);
+  } finally { restore(); provider.reset(); }
+});
+
+test("MOCK emits a fabricated incoming reaction to one of the user's messages", async () => {
+  const restore = installIsolatedBrowserStubs();
+  try {
+    provider.reset();
+    let received: Extract<import("./provider").BridgeEvent, { type: "reaction" }> | undefined;
+    const connection = provider.subscribe((event) => {
+      if (event.type === "reaction") received = event;
+    }, () => {}, () => {}, () => {});
+    await new Promise((resolve) => setImmediate(resolve));
+    provider.simulateReaction();
+    connection.close();
+
+    assert.equal(received?.chatId, "mock-group-garden");
+    assert.equal(received?.messageId, "mock-garden-2");
+    assert.equal(received?.parentFromMe, true);
+    assert.equal(received?.actorIsMe, false);
+    assert.equal(received?.fromMe, false);
+    assert.equal(received?.actorId, "mock-actor-nia");
+    assert.equal(received?.emoji, "🌱");
+    assert.ok(received?.reactionId);
+    assert.ok(Number.isSafeInteger(received?.timestamp));
     assert.equal(networkAttempts, 0);
   } finally { restore(); provider.reset(); }
 });
@@ -301,7 +326,7 @@ test("mock plugin entrypoint initializes and dismounts offline with isolated Dec
   globalThis.fetch = async () => { networkAttempts += 1; throw new Error("Network disabled before mock entrypoint import"); };
   globalThis.WebSocket = class { constructor() { networkAttempts += 1; throw new Error("WebSocket disabled before mock entrypoint import"); } } as unknown as typeof WebSocket;
   try {
-    const { default: initialize } = await import("../../artifacts/decky-whatsapp-mock/dist/index.js?isolated-runtime");
+    const { default: initialize } = await import("../../../artifacts/decky-whatsapp-mock/dist/index.js?isolated-runtime");
     const first = initialize();
     assert.equal(first.name, "Decky WhatsApp MOCK");
     const html = renderToStaticMarkup(first.content as React.ReactElement);
@@ -345,10 +370,12 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
   const rpcCalls: unknown[][] = [];
   const apiNames: string[] = [];
   const networkUrls: string[] = [];
+  const toastCalls: Array<{ title?: string; body?: string; playSound?: boolean }> = [];
   const intervals = new Map<number, ReturnType<typeof setInterval>>();
   const activeTimeouts = new Set<ReturnType<typeof setTimeout>>();
   let nextTimerId = 1;
   let resumeUnregistered = 0;
+  let resumeCallback: (() => void) | undefined;
   let controllerUnregistered = 0;
   let controllerListener: ((controllerIndex: number, gamepadButton: number, isButtonPressed: boolean) => void) | undefined;
   const timers = {
@@ -409,7 +436,7 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
   globalThis.fetch = async (input) => { networkUrls.push(String(input)); throw new Error("Network disabled in active mock panel test"); };
   globalThis.WebSocket = class { constructor(url: string) { networkUrls.push(url); throw new Error("WebSocket disabled in active mock panel test"); } } as unknown as typeof WebSocket;
   (globalThis as { SteamClient?: unknown }).SteamClient = {
-    System: { RegisterForOnResumeFromSuspend() { return { unregister() { resumeUnregistered += 1; } }; } },
+    System: { RegisterForOnResumeFromSuspend(callback: () => void) { resumeCallback = callback; return { unregister() { resumeUnregistered += 1; } }; } },
     Input: { RegisterForControllerInputMessages(callback: typeof controllerListener) {
       controllerListener = callback;
       return { unregister() { controllerUnregistered += 1; } };
@@ -418,7 +445,7 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
   const apiInit = {
       connect(_version: number, name: string) {
         apiNames.push(name);
-        return { _version: 2, toaster: { toast() {} }, call(...args: unknown[]) { rpcCalls.push(args); } };
+        return { _version: 2, toaster: { toast(notification: { title?: string; body?: string; playSound?: boolean }) { toastCalls.push(notification); } }, call(...args: unknown[]) { rpcCalls.push(args); } };
       }
     };
   (globalThis as { __DECKY_SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED_deckyLoaderAPIInit?: unknown })
@@ -435,8 +462,16 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
   const flush = async () => {
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)); });
   };
+  const videoPlayback = {
+    paused: true,
+    playCalls: 0,
+    pauseCalls: 0,
+    play() { this.playCalls += 1; this.paused = false; return Promise.resolve(); },
+    pause() { this.pauseCalls += 1; this.paused = true; }
+  };
   const mountPanel = (content: React.ReactElement) => create(content, {
     createNodeMock(element) {
+      if (element.type === "video") return videoPlayback;
       if (element.type !== "div") return null;
       return { ownerDocument: globalThis.document, querySelectorAll() { return []; }, querySelector() { return null; } };
     }
@@ -445,9 +480,10 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
   let renderer: ReturnType<typeof create> | undefined;
   let descriptor: { name: string; content: React.ReactElement; onDismount?: () => void } | undefined;
   try {
-    const { default: initialize } = await import("../../artifacts/decky-whatsapp-mock/dist/index.js?active-react-mount");
+    const { default: initialize } = await import("../../../artifacts/decky-whatsapp-mock/dist/index.js?active-react-mount");
     descriptor = initialize() as typeof descriptor;
     assert.equal(descriptor?.name, "Decky WhatsApp MOCK");
+    assert.ok(resumeCallback, "the offline MOCK entrypoint should register its isolated Steam resume callback");
     await act(async () => { renderer = mountPanel(descriptor!.content); });
     await flush();
     const mockPanelScopes = renderer!.root.findAll((node) => node.props["data-decky-scope"] === "mock-panel");
@@ -457,6 +493,8 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
     assert.equal(mockPanelScopes[0].props["aria-label"], "MOCK / OFFLINE");
     assert.ok(renderer!.root.findAllByType("input").some((input) => input.props["aria-label"] === "Search mock contacts"));
     assert.ok(findButton(renderer!, "Start"));
+    await act(async () => { resumeCallback?.(); });
+    assert.ok(findButton(renderer!, "Start"), "resume while disabled must not enable or reconnect the MOCK panel");
 
     await act(async () => { findButton(renderer!, "Settings")!.props.onClick(); });
     assert.equal(renderer!.root.findAll((node) => node.props["data-decky-scope"] === "mock-panel").length, 1,
@@ -465,16 +503,56 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
 
     await act(async () => { findButton(renderer!, "Start")!.props.onClick(); });
     await flush();
+    await act(async () => { resumeCallback?.(); resumeCallback?.(); });
+    await flush();
     const ava = findButton(renderer!, "Ava Example");
     assert.ok(ava, "fixture contact should load after enabling the mock connection");
     await act(async () => { findButton(renderer!, "Simulate incoming message")!.props.onClick(); });
     assert.ok(findButton(renderer!, "Deterministic incoming mock"), "active provider subscription should render a fabricated incoming event");
+    assert.equal(renderer!.root.findAllByType("button").filter((button) => textOf(button as unknown as { children: unknown[] }).includes("Deterministic incoming mock")).length, 1,
+      "repeated resume callbacks must not leak MOCK subscriptions or duplicate events");
+    // The notification session uses second-resolution event times. Wait into a
+    // later second so this simulated event cannot be mistaken for reconnect history.
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1050)); });
+    await act(async () => { findButton(renderer!, "Simulate reaction to your message")!.props.onClick(); });
+    await flush();
+    assert.equal(toastCalls.filter((toast) => toast.title === "Reaction to your message" && toast.body === "🌱").length, 1,
+      "a fabricated incoming reaction to the user's own message should reach the Decky toast API once");
     await act(async () => { ava!.props.onClick(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 180)); });
     await flush();
     assert.ok(findButton(renderer!, "Did you see the mock album?"), "fixture history should render after opening a conversation");
     assert.equal(renderer!.root.findAll((node) => node.props["data-decky-scope"] === "mock-panel").length, 1,
       "the MOCK scope should persist while a conversation is visible");
+
+    const video = renderer!.root.findByType("video");
+    assert.equal(video.props["data-decky-message-id"], undefined);
+    assert.equal(video.props.controls, true, "ordinary video exposes native controls");
+    assert.notEqual(video.props.autoPlay, true, "ordinary video must not autoplay");
+    assert.equal(video.props.preload, "metadata");
+    assert.match(video.props.src, /^data:video\/webm;base64,GkXfo/);
+    const encodedVideo = video.props.src.slice(video.props.src.indexOf(",") + 1);
+    const videoBytes = Buffer.from(encodedVideo, "base64");
+    assert.deepEqual([...videoBytes.subarray(0, 4)], [0x1a, 0x45, 0xdf, 0xa3], "fixture begins with the WebM EBML signature");
+    assert.equal(videoBytes.length, 2366, "fixture retains the locally decoded fabricated clip bytes");
+    assert.ok(renderer!.root.findAll((node) => node.type === "div" && textOf(node as unknown as { children: unknown[] }).includes("Video · select it and press Y")).length > 0,
+      "ordinary video is labelled accurately");
+    const videoRow = renderer!.root.findAll((node) => node.props["data-decky-message-id"] === "mock-ava-video")
+      .find((node) => typeof node.props.onFocusCapture === "function");
+    assert.ok(videoRow, "ordinary video row should be focusable for controller playback");
+    assert.match(textOf(videoRow as unknown as { children: unknown[] }), /select it and press Y/,
+      "the player hint should mention controller playback");
+    await act(async () => { videoRow.props.onFocusCapture(); });
+    await act(async () => { controllerListener?.(0, 3, true); });
+    assert.equal(videoPlayback.playCalls, 1, "controller Y starts ordinary video playback");
+    assert.equal(videoPlayback.paused, false);
+    await act(async () => { controllerListener?.(0, 3, true); });
+    assert.equal(videoPlayback.pauseCalls, 1, "controller Y pauses an already-playing ordinary video");
+    assert.equal(videoPlayback.paused, true);
+    await act(async () => { video.props.onError(); });
+    assert.ok(renderer!.root.findAll((node) => textOf(node as unknown as { children: unknown[] }).includes("Video unavailable")).length > 0,
+      "video playback errors show an unavailable fallback");
+    assert.ok(findButton(renderer!, "Retry media"), "the unavailable video can use the existing retry flow");
 
     const fixtureMessage = findButton(renderer!, "Did you see the mock album?");
     await act(async () => { fixtureMessage!.props.onClick(); });
@@ -530,6 +608,7 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
     }
     assert.equal(findButton(renderer!, "Retry media"), undefined, "view-once placeholders must not offer a media retry");
     assert.equal(renderer!.root.findAllByType("audio").length, 0, "the view-once audio placeholder must not expose a player");
+    assert.equal(renderer!.root.findAllByType("video").length, 0, "the view-once video placeholder must not expose a player");
     for (const messageId of viewOnceIds) {
       const row = renderer!.root.findAll((node) => node.props["data-decky-message-id"] === messageId)
         .find((node) => typeof node.props.onKeyDown === "function")!;
@@ -545,6 +624,8 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
     assert.equal(intervals.size, 0, "unmount should clear the health polling interval");
     assert.ok(controllerUnregistered >= 1, "unmount should unregister controller handlers");
     assert.equal(resumeUnregistered, 1, "plugin dismount should unregister the Decky resume handler");
+    await act(async () => { resumeCallback?.(); });
+    assert.equal(intervals.size, 0, "a saved late resume callback after dismount must not restart panel work");
 
     descriptor = initialize() as typeof descriptor;
     await act(async () => { renderer = mountPanel(descriptor!.content); });

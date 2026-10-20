@@ -13,7 +13,20 @@ export type BridgeEvent =
   | { type: "message"; message: IncomingMessage }
   | { type: "message_update"; update: "edited" | "deleted"; message: IncomingMessage }
   | { type: "message_ack"; chatId: string; messageId: string; ack: number }
-  | { type: "reaction"; chatId: string; messageId: string; emoji: string; fromMe: boolean };
+  | {
+      type: "reaction";
+      chatId: string;
+      messageId: string;
+      emoji: string;
+      /** Whether the current user sent this reaction (kept for conversation UI updates). */
+      fromMe: boolean;
+      /** Reaction identity and attribution used by fail-closed notification handling. */
+      reactionId?: string;
+      actorId?: string;
+      actorIsMe?: boolean;
+      parentFromMe?: boolean;
+      timestamp?: number;
+    };
 
 export interface IncomingMessage {
   id: string;
@@ -25,7 +38,7 @@ export interface IncomingMessage {
   fromMe: boolean;
   ack?: number;
   viewOnce?: boolean;
-  mediaKind?: "image" | "sticker" | "gif" | "audio";
+  mediaKind?: "image" | "sticker" | "gif" | "audio" | "video";
   reaction?: string;
   reactions?: string[];
   image?: {
@@ -35,7 +48,7 @@ export interface IncomingMessage {
   media?: {
     dataUrl: string;
     filename?: string;
-    kind: "image" | "sticker" | "gif" | "audio";
+    kind: "image" | "sticker" | "gif" | "audio" | "video";
     mimetype: string;
   };
 }

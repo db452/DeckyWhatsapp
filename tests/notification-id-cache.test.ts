@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createNotificationIdCache } from "../decky-plugin/src/notification-id-cache.ts";
+import { createNotificationIdCache } from "../decky-plugin/src/notifications/notification-id-cache.ts";
 
 test("notification ID cache detects recently seen IDs and evicts the oldest at its limit", () => {
   const cache = createNotificationIdCache(2);

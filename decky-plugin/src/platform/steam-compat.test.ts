@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { attachResumeRegistration } from "./plugin-lifecycle";
+import { attachResumeRegistration } from "../plugin-lifecycle";
 import { registerControllerInputMessages, registerOnResumeFromSuspend } from "./steam-compat";
 
 type SteamGlobal = typeof globalThis & { SteamClient?: unknown };

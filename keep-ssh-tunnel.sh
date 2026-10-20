@@ -29,6 +29,7 @@ BRIDGE_PORT="$(normalize_port "${BRIDGE_PORT}")" || fail "Bridge port must be a 
 valid_deck_host "${DECK_HOST}" || fail "Invalid Steam Deck hostname/address. Use a DNS hostname or IPv4 address without spaces, ports, or SSH options."
 command -v node >/dev/null 2>&1 || fail "Node.js is unavailable."
 command -v ssh >/dev/null 2>&1 || fail "OpenSSH client is unavailable."
+[[ -r "${PROJECT_ROOT}/scripts/linux-bridge-helper.mjs" ]] || fail "Linux bridge helper is missing from ${PROJECT_ROOT}/scripts; re-extract the complete companion package."
 node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' || fail "Node.js 22 or newer is required; found $(node --version)."
 command -v timeout >/dev/null 2>&1 || fail "The coreutils timeout command is unavailable; it is required to bound the read-only SSH owner probe."
 [[ -x "${PROJECT_ROOT}/node_modules/.bin/tsx" ]] || fail "Project dependencies are missing; run install-decky-whatsapp-linux.sh first."
@@ -55,6 +56,9 @@ SSH_FIFO_KEEPALIVE_FD=""
 SSH_CAPTURE_UNVERIFIED=0
 STOPPING=0
 REMOTE_OWNER="unknown"
+AUTH_ATTEMPTED=0
+STALE_RECOVERY_ACTIVE=0
+STALE_RECOVERY_DEADLINE=0
 
 parse_proc_stat_identity() {
   local stat_line="$1"
@@ -134,53 +138,7 @@ start_ssh_log_reader() {
   SSH_LOG_FIFO="${SSH_LOG_DIR}/ssh-stderr.fifo"
   mkfifo -- "${SSH_LOG_FIFO}" || return 1
   exec {SSH_FIFO_KEEPALIVE_FD}<>"${SSH_LOG_FIFO}" || return 1
-  node --input-type=module -e '
-import { existsSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-
-const outputPath = process.argv[1];
-const capacity = 64 * 1024;
-const tail = Buffer.alloc(capacity);
-let cursor = 0;
-let filled = 0;
-
-function copyCircular(chunk, sourceOffset, count, destinationOffset) {
-  const first = Math.min(count, capacity - destinationOffset);
-  chunk.copy(tail, destinationOffset, sourceOffset, sourceOffset + first);
-  if (first < count) chunk.copy(tail, 0, sourceOffset + first, sourceOffset + count);
-}
-
-for await (const chunk of process.stdin) {
-  // Keep terminal I/O out of this reader so a blocked TTY cannot stall FIFO draining.
-  if (chunk.length >= capacity) {
-    const sourceOffset = chunk.length - capacity;
-    const oldest = (cursor + (chunk.length % capacity)) % capacity;
-    copyCircular(chunk, sourceOffset, capacity, oldest);
-    cursor = (cursor + (chunk.length % capacity)) % capacity;
-    filled = capacity;
-  } else {
-    copyCircular(chunk, 0, chunk.length, cursor);
-    cursor = (cursor + chunk.length) % capacity;
-    filled = Math.min(capacity, filled + chunk.length);
-  }
-}
-
-const start = filled === capacity ? cursor : 0;
-const retained = Buffer.alloc(filled);
-const first = Math.min(filled, capacity - start);
-tail.copy(retained, 0, start, start + first);
-if (first < filled) tail.copy(retained, first, 0, filled - first);
-const directory = dirname(outputPath);
-const cleanupMarker = `${outputPath}.cleanup`;
-if (existsSync(cleanupMarker)) {
-  for (const path of [outputPath, `${directory}/ssh-stderr.fifo`, cleanupMarker]) {
-    try { unlinkSync(path); } catch {}
-  }
-  try { rmdirSync(directory); } catch {}
-} else {
-  writeFileSync(outputPath, retained, { mode: 0o600 });
-}
-' "${SSH_LOG_FILE}" {SSH_FIFO_KEEPALIVE_FD}>&- < "${SSH_LOG_FIFO}" &
+  node "${PROJECT_ROOT}/scripts/linux-bridge-helper.mjs" ssh-log-reader "${SSH_LOG_FILE}" {SSH_FIFO_KEEPALIVE_FD}>&- < "${SSH_LOG_FIFO}" &
   SSH_LOGGER_PID=$!
   SSH_LOGGER_START_TIME="$(child_start_time "${SSH_LOGGER_PID}")" || {
     close_ssh_log_keepalive
@@ -219,33 +177,8 @@ remove_ssh_log_files() {
 
 shutdown_bridge_by_identity() {
   [[ -n "${BRIDGE_SESSION_ID}" ]] && child_is_running "${BRIDGE_PID}" "${BRIDGE_START_TIME}" || return 1
-  node --input-type=module - "${BRIDGE_PORT}" "${BRIDGE_PID}" "${BRIDGE_SESSION_ID}" <<'NODE'
-const [port, expectedPid, expectedSessionId] = process.argv.slice(2);
-const base = `http://127.0.0.1:${port}`;
-const timeout = AbortSignal.timeout(1800);
-try {
-  const bootstrap = await fetch(`${base}/bootstrap`, {
-    headers: { Origin: "https://steamloopback.host" },
-    signal: timeout
-  });
-  if (!bootstrap.ok) process.exit(2);
-  const { token } = await bootstrap.json();
-  const headers = { Authorization: `Bearer ${token}` };
-  const health = await fetch(`${base}/health`, { headers, signal: timeout });
-  if (!health.ok) process.exit(2);
-  const identity = await health.json();
-  if (String(identity.processId) !== expectedPid || identity.sessionId !== expectedSessionId) process.exit(2);
-  const response = await fetch(`${base}/shutdown`, {
-    method: "POST",
-    headers: { ...headers, "Content-Type": "application/json" },
-    body: JSON.stringify({ expectedSessionId }),
-    signal: AbortSignal.timeout(1800)
-  });
-  if (!response.ok) process.exit(2);
-} catch {
-  process.exitCode = 1;
-}
-NODE
+  node "${PROJECT_ROOT}/scripts/linux-bridge-helper.mjs" bridge-shutdown \
+    "${BRIDGE_PORT}" "${BRIDGE_PID}" "${BRIDGE_SESSION_ID}"
 }
 
 cleanup() {
@@ -292,15 +225,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-if node - "${BRIDGE_PORT}" <<'NODE'
-const net = require("node:net");
-const port = Number(process.argv[2]);
-const socket = net.connect({ host: "127.0.0.1", port });
-socket.setTimeout(450);
-socket.once("connect", () => process.exit(0));
-socket.once("error", () => process.exit(1));
-socket.once("timeout", () => process.exit(1));
-NODE
+if node "${PROJECT_ROOT}/scripts/linux-bridge-helper.mjs" port-open "${BRIDGE_PORT}"
 then
   fail "Local loopback port ${BRIDGE_PORT} is already occupied. Its owner was left running; stop or inspect that session before retrying."
 fi
@@ -314,30 +239,8 @@ BRIDGE_START_TIME="$(child_start_time "${BRIDGE_PID}")" || fail "Could not verif
 
 for attempt in {1..30}; do
   child_is_running "${BRIDGE_PID}" "${BRIDGE_START_TIME}" || fail "The bridge process exited or changed identity before it became ready. Check the bridge output above."
-  if BRIDGE_SESSION_ID="$(node --input-type=module - "${BRIDGE_PORT}" "${BRIDGE_PID}" <<'NODE' 2>/dev/null
-const [port, expectedPid] = process.argv.slice(2);
-const base = `http://127.0.0.1:${port}`;
-try {
-  const timeout = AbortSignal.timeout(900);
-  const bootstrap = await fetch(`${base}/bootstrap`, {
-    headers: { Origin: "https://steamloopback.host" },
-    signal: timeout
-  });
-  if (!bootstrap.ok) process.exit(1);
-  const { token } = await bootstrap.json();
-  const health = await fetch(`${base}/health`, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal: timeout
-  });
-  if (!health.ok) process.exit(1);
-  const identity = await health.json();
-  if (String(identity.processId) !== expectedPid || !/^[0-9a-f-]{36}$/i.test(identity.sessionId)) process.exit(1);
-  process.stdout.write(identity.sessionId);
-} catch {
-  process.exitCode = 1;
-}
-NODE
-  )" && [[ "${BRIDGE_SESSION_ID}" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+  if BRIDGE_SESSION_ID="$(node "${PROJECT_ROOT}/scripts/linux-bridge-helper.mjs" bridge-session \
+    "${BRIDGE_PORT}" "${BRIDGE_PID}" 2>/dev/null)" && [[ "${BRIDGE_SESSION_ID}" =~ ^[0-9a-fA-F-]{36}$ ]]; then
     break
   fi
   BRIDGE_SESSION_ID=""
@@ -352,16 +255,7 @@ diagnose_remote_owner() {
   local probe_port
   local fingerprint
   REMOTE_OWNER="unknown"
-  probe_port="$(node - <<'NODE'
-const net = require("node:net");
-const server = net.createServer();
-server.listen(0, "127.0.0.1", () => {
-  const address = server.address();
-  process.stdout.write(String(address.port));
-  server.close();
-});
-NODE
-  )" || return 0
+  probe_port="$(node "${PROJECT_ROOT}/scripts/linux-bridge-helper.mjs" reserve-port)" || return 0
   [[ "${probe_port}" =~ ^[0-9]+$ ]] || return 0
 
   timeout --signal=TERM --kill-after=1s 5s ssh -N -T \
@@ -382,31 +276,7 @@ NODE
   }
   sleep 0.4
   if child_is_running "${PROBE_SSH_PID}" "${PROBE_SSH_START_TIME}"; then
-    if fingerprint="$(node --input-type=module - "${probe_port}" <<'NODE' 2>/dev/null
-import http from "node:http";
-const port = Number(process.argv[2]);
-const request = http.get({ hostname: "127.0.0.1", port, path: "/health", signal: AbortSignal.timeout(1800) }, response => {
-  const chunks = [];
-  let size = 0;
-  response.on("data", chunk => {
-    size += chunk.length;
-    if (size <= 128) chunks.push(chunk);
-    else request.destroy();
-  });
-  response.on("end", () => {
-    if (size > 128) return process.stdout.write("unknown");
-    const body = Buffer.concat(chunks).toString("utf8");
-    if (response.statusCode === 401 && /^\s*\{\s*"error"\s*:\s*"Bridge authorization required"\s*\}\s*$/.test(body)) {
-      process.stdout.write("decky-whatsapp");
-    } else {
-      process.stdout.write("other-http-service");
-    }
-  });
-});
-request.on("timeout", () => request.destroy());
-request.on("error", () => process.stdout.write("unknown"));
-NODE
-    )"; then :; else fingerprint="unknown"; fi
+    if fingerprint="$(node "${PROJECT_ROOT}/scripts/linux-bridge-helper.mjs" fingerprint "${probe_port}" 2>/dev/null)"; then :; else fingerprint="unknown"; fi
     case "${fingerprint}" in
       decky-whatsapp|other-http-service) REMOTE_OWNER="${fingerprint}" ;;
       *) REMOTE_OWNER="unknown" ;;
@@ -419,9 +289,19 @@ NODE
 
 while true; do
   child_is_running "${BRIDGE_PID}" "${BRIDGE_START_TIME}" || fail "The bridge process stopped or changed identity; the tunnel will not be restarted."
+  SSH_RECONNECT_ARGS=()
+  if ((AUTH_ATTEMPTED)); then SSH_RECONNECT_ARGS+=(-o BatchMode=yes); fi
+  if ((STALE_RECOVERY_ACTIVE)); then
+    if ((SECONDS >= STALE_RECOVERY_DEADLINE)); then
+      fail "The Deck port remained occupied through the bounded stale-tunnel recovery window. Confirm SSH authentication and the optional Deck sshd keepalive setting, inspect the remote port owner, then restart the launcher manually. No remote process was stopped."
+    fi
+    SSH_RECONNECT_ARGS+=(-v -o BatchMode=yes -o ConnectTimeout=5)
+  fi
   start_ssh_log_reader || fail "Could not start the bounded private SSH output reader."
   ssh -N -T \
     "${SSH_AUTH_ARGS[@]}" \
+    "${SSH_RECONNECT_ARGS[@]}" \
+    -o ConnectTimeout=10 \
     -o ServerAliveInterval=15 \
     -o ServerAliveCountMax=3 \
     -o TCPKeepAlive=yes \
@@ -429,6 +309,7 @@ while true; do
     -R "${BRIDGE_PORT}:127.0.0.1:${BRIDGE_PORT}" \
     "${REMOTE}" </dev/tty 2>"${SSH_LOG_FIFO}" {SSH_FIFO_KEEPALIVE_FD}>&- &
   SSH_PID=$!
+  AUTH_ATTEMPTED=1
   SSH_START_TIME="$(child_start_time "${SSH_PID}")" || {
     printf 'Could not verify the launched SSH tunnel process identity; refusing to signal or wait for its PID.\n' >&2
     disown "${SSH_PID}" 2>/dev/null || true
@@ -454,13 +335,54 @@ while true; do
   SSH_START_TIME=""
   finish_ssh_log_reader || true
 
+  if ((AUTH_ATTEMPTED)) && grep -Eiq '(permission denied|authentication failed|no more authentication methods|too many authentication failures|passphrase)' "${SSH_LOG_FILE}"; then
+    remove_ssh_log_files
+    fail "SSH authentication failed during an automatic reconnect. BatchMode will not prompt for a password or unavailable key passphrase; confirm SSH authentication, then restart the launcher manually."
+  fi
+  if grep -Eiq '(administratively prohibited|remote forwarding.*disabled)' "${SSH_LOG_FILE}"; then
+    remove_ssh_log_files
+    fail "The SSH server refused remote forwarding by policy. Ask the Deck administrator to allow remote forwarding; no automatic retry was made."
+  fi
+
   if grep -Eiq 'remote port forwarding failed' "${SSH_LOG_FILE}"; then
     remove_ssh_log_files
-    fail "The Steam Deck refused the reverse tunnel because its remote port is already occupied or forwarding is unavailable. First-connected session policy preserved; no remote process was changed."
+    child_is_running "${BRIDGE_PID}" "${BRIDGE_START_TIME}" || fail "The bridge process stopped or changed identity; the tunnel will not be restarted."
+    diagnose_remote_owner
+    case "${REMOTE_OWNER}" in
+      decky-whatsapp)
+        fail "A DeckyWhatsapp bridge responds on the Deck port. First-connected session policy preserved; the existing remote session was not changed."
+        ;;
+      other-http-service)
+        fail "An HTTP service responds on the Deck port but is not identified as DeckyWhatsapp. Its owner was left untouched."
+        ;;
+      *)
+        if ((!STALE_RECOVERY_ACTIVE)); then
+          STALE_RECOVERY_ACTIVE=1
+          STALE_RECOVERY_DEADLINE=$((SECONDS + 90))
+          printf 'Remote port owner is ambiguous. Waiting up to 90 seconds and retrying SSH every 5 seconds in BatchMode; no remote process will be stopped.\n'
+        else
+          printf 'Remote port remains ambiguous; retrying while the bounded 90-second recovery window remains.\n'
+        fi
+        sleep 5
+        continue
+        ;;
+    esac
+  fi
+  child_is_running "${BRIDGE_PID}" "${BRIDGE_START_TIME}" || fail "The bridge process stopped or changed identity; the tunnel will not be restarted."
+  if ((STALE_RECOVERY_ACTIVE)); then
+    if grep -Eiq "remote forward success for:.*listen[[:space:]]+([^[:space:],]+:)?${BRIDGE_PORT}([[:space:],]|$)" "${SSH_LOG_FILE}"; then
+      STALE_RECOVERY_ACTIVE=0
+      printf 'OpenSSH confirmed the remote forward. Normal tunnel supervision is active.\n'
+    elif ((SECONDS >= STALE_RECOVERY_DEADLINE)); then
+      remove_ssh_log_files
+      fail "SSH did not confirm the remote forward before the bounded recovery window ended. Review SSH diagnostics, confirm authentication and the optional Deck sshd keepalive setting, then restart manually."
+    else
+      printf 'Recovery SSH exited before OpenSSH confirmed the remote forward; retrying within the bounded window.\n'
+      sleep 5
+      continue
+    fi
   fi
   remove_ssh_log_files
-
-  child_is_running "${BRIDGE_PID}" "${BRIDGE_START_TIME}" || fail "The bridge process stopped or changed identity; the tunnel will not be restarted."
   printf 'SSH tunnel exited with status %s. Checking the remote port without authentication or destructive actions...\n' "${SSH_EXIT}"
   diagnose_remote_owner
   case "${REMOTE_OWNER}" in

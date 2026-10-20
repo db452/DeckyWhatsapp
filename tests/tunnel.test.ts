@@ -13,6 +13,8 @@ const tunnelScript = join(process.cwd(), "keep-ssh-tunnel.ps1");
 const launcherScript = join(process.cwd(), "start-decky-whatsapp.bat");
 const backgroundControllerScript = join(process.cwd(), "manage-decky-whatsapp.ps1");
 const conflictMessage = "SSH could not establish remote forwarding on port";
+const closeNotice = "This launcher will not stop remote processes. Check the port owner or SSH forwarding policy, then try again.";
+const nonInteractiveStopNotice = "The launcher is stopping without prompting or retrying again. It will not stop remote processes.";
 // The Windows guest measured 3.5–4.5 seconds to start a trivial PowerShell child.
 // Allow one startup budget plus output scheduling time, while keeping waits bounded.
 const WINDOWS_PROCESS_STARTUP_BUDGET_MS = 5_000;
@@ -30,6 +32,20 @@ function isChildRunning(child: ChildProcessWithoutNullStreams): boolean {
 
 function acknowledgeChild(child: ChildProcessWithoutNullStreams): void {
   if (isChildRunning(child) && child.stdin.writable && !child.stdin.destroyed) child.stdin.write("\r\n");
+}
+
+async function acknowledgeAfterCloseNotice(
+  output: ReturnType<typeof watchOutput>,
+  child: ChildProcessWithoutNullStreams
+): Promise<void> {
+  // Windows PowerShell's redirected Read-Host prompt is not captured by these pipes.
+  // This final notice is emitted immediately before Read-Host consumes the buffered input.
+  await output.waitFor(closeNotice, WINDOWS_NESTED_PROCESS_WAIT_MS);
+  child.stdin.write("\r\n");
+}
+
+async function waitForNonInteractiveStop(output: ReturnType<typeof watchOutput>): Promise<void> {
+  await output.waitFor(nonInteractiveStopNotice, WINDOWS_NESTED_PROCESS_WAIT_MS);
 }
 
 async function stopOwnedChild(child: ChildProcessWithoutNullStreams): Promise<void> {
@@ -131,22 +147,17 @@ async function assertAttemptMarkers(directory: string, expected: string[]): Prom
 }
 
 test("Linux SSH log reader drains and captures diagnostics without writing to the terminal", { timeout: 10_000 }, async (t) => {
-  const shell = await readFile(join(process.cwd(), "keep-ssh-tunnel.sh"), "utf8");
-  const commandStart = shell.indexOf("node --input-type=module -e '\n");
-  assert.notEqual(commandStart, -1, "the Linux supervisor embeds its private SSH log reader");
-  const sourceStart = commandStart + "node --input-type=module -e '\n".length;
-  const sourceEnd = shell.indexOf("\n' \"${SSH_LOG_FILE}\"", sourceStart);
-  assert.notEqual(sourceEnd, -1, "the embedded SSH log reader has a clear shell boundary");
-  const readerSource = shell.slice(sourceStart, sourceEnd);
-  assert.doesNotMatch(readerSource, /process\.stderr|process\.stdout|console\./,
-    "the FIFO reader must not attempt potentially blocking terminal output");
+  const helperPath = join(process.cwd(), "scripts", "linux-bridge-helper.mjs");
   const directory = await mkdtemp(join(tmpdir(), "decky-linux-log-reader-test-"));
   const outputPath = join(directory, "ssh-output");
   t.after(() => rm(directory, { recursive: true, force: true }));
 
   // Any accidental terminal write fails immediately; the reader must still consume all input.
+  const terminalWriteGuard = `data:text/javascript,${encodeURIComponent(
+    "process.stderr.write = () => { throw new Error('terminal output attempted'); }; process.stdout.write = () => { throw new Error('terminal output attempted'); };"
+  )}`;
   const child = spawn(process.execPath, [
-    "--input-type=module", "-e", `process.stderr.write = () => { throw new Error('terminal output attempted'); };\n${readerSource}`, outputPath
+    "--import", terminalWriteGuard, helperPath, "ssh-log-reader", outputPath
   ], { stdio: ["pipe", "ignore", "ignore"] });
   t.after(() => stopOwnedChild(child));
   child.stdin.end(Buffer.alloc(256 * 1024, 0x61));
@@ -168,6 +179,79 @@ test("Linux SSH FIFO keepalive remains open until the SSH writer has exited", as
   assert.match(shell.slice(launch, wait), /<\/dev\/tty/, "SSH continues to read password and passphrase prompts directly from the terminal");
 });
 
+test("Linux recovery accepts OpenSSH confirmation, resets after recovery, and stops on auth or policy failures", async () => {
+  const shell = await readFile(join(process.cwd(), "keep-ssh-tunnel.sh"), "utf8");
+  assert.match(shell, /SSH_RECONNECT_ARGS\+=\(-o BatchMode=yes\)/,
+    "automatic SSH reconnects must not reopen password prompts");
+  assert.match(shell, /STALE_RECOVERY_DEADLINE=\$\(\(SECONDS \+ 90\)\)/,
+    "ambiguous remote conflicts get a bounded recovery window");
+  assert.match(shell, /SSH_RECONNECT_ARGS\+=\(-v -o BatchMode=yes -o ConnectTimeout=5\)/,
+    "recovery retries are non-interactive and have bounded SSH connect time");
+  const confirmation = shell.match(/if grep -Eiq "(remote forward success for:.*?)" "\$\{SSH_LOG_FILE\}"/s)?.[1];
+  assert.ok(confirmation, "recovery checks OpenSSH's positive forward confirmation in its captured log");
+  assert.match(confirmation, /\[\[:space:\],\]/, "the OpenSSH confirmation accepts a comma after the listen port");
+  const completeOpenSshLine = "debug1: Remote forward success for: listen 8787, connect 127.0.0.1:8787";
+  const javascriptPattern = confirmation.replaceAll("[:space:]", "\\s").replaceAll("${BRIDGE_PORT}", "8787");
+  assert.match(completeOpenSshLine, new RegExp(javascriptPattern, "i"),
+    "the real complete verbose line with its comma delimiter is accepted");
+  const confirmedBranch = shell.indexOf(confirmation);
+  const recoveryReset = shell.indexOf("STALE_RECOVERY_ACTIVE=0", confirmedBranch);
+  const nextRecoveryAllowance = shell.indexOf("if ((!STALE_RECOVERY_ACTIVE))");
+  const recoveryLoop = shell.indexOf("while true; do");
+  assert.ok(recoveryLoop >= 0 && nextRecoveryAllowance > recoveryLoop && nextRecoveryAllowance < confirmedBranch && recoveryReset > confirmedBranch,
+    "positive confirmation clears the guard so the next loop cycle can open a fresh recovery window");
+  assert.match(shell, /if \(\(AUTH_ATTEMPTED\)\) && grep -Eiq '\(permission denied\|authentication failed/,
+    "Linux automatic reconnection auth failures are classified outside the stale-conflict branch");
+  assert.match(shell, /SSH authentication failed during an automatic reconnect[\s\S]*confirm SSH authentication/,
+    "Linux auth failure guidance tells the user how to recover");
+  assert.match(shell, /administratively prohibited\|remote forwarding\.\*disabled/,
+    "forwarding policy failures must stop instead of being retried");
+});
+
+test("Windows supervisor stops after authentication fails on an ordinary BatchMode reconnect", { timeout: 30_000 }, async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
+
+  const bridge = createServer();
+  bridge.listen(0, "127.0.0.1");
+  await once(bridge, "listening");
+  const address = bridge.address();
+  assert.ok(address && typeof address !== "string");
+  const directory = await mkdtemp(join(tmpdir(), "decky-tunnel-reconnect-auth-test-"));
+  const mockSshPath = join(directory, "mock-ssh.ps1");
+  const callsPath = join(directory, "ssh-calls.txt");
+  await writeFile(mockSshPath, `
+param([string]$CallsPath)
+$count = 0
+if (Test-Path -LiteralPath $CallsPath) { $count = (Get-Content -LiteralPath $CallsPath).Count }
+[System.IO.File]::AppendAllText($CallsPath, "attempt$([Environment]::NewLine)")
+if ($count -eq 0) { [Console]::Error.WriteLine('ssh: connect to host steamdeck.test port 22: Connection timed out') }
+else { [Console]::Error.WriteLine('deck@steamdeck.test: Permission denied (publickey,password).') }
+exit 255
+`, "utf8");
+  const sshOverride = Buffer.from(JSON.stringify(["-NoProfile", "-File", mockSshPath, callsPath])).toString("base64");
+  const unknownProbeOverride = Buffer.from(JSON.stringify(["-NoProfile", "-Command", "exit 255"])).toString("base64");
+  const child = spawn(powershell, [
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
+    "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port),
+    "-NonInteractive", "-SshExecutable", powershell,
+    "-SshArgumentsOverrideBase64", sshOverride,
+    "-DiagnosticProbeOverrideBase64", unknownProbeOverride
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+  t.after(async () => {
+    await new Promise<void>((resolve) => bridge.close(() => resolve()));
+    await stopOwnedChild(child);
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const output = watchOutput(child);
+  await output.waitFor("SSH authentication failed during an automatic reconnect", WINDOWS_RECOVERY_STAGE_WAIT_MS * 2);
+  const [exitCode] = await once(child, "close");
+  assert.equal(exitCode, 1);
+  assert.match(output.output, /BatchMode will not prompt for a password/);
+  assert.equal((await readFile(callsPath, "utf8")).trim().split(/\r?\n/).length, 2,
+    "authentication failure stops the ordinary reconnect loop");
+});
+
 test("the Linux launcher resolves installer-style symlinks before loading project helpers", async () => {
   const launcher = await readFile(join(process.cwd(), "start-decky-whatsapp-linux.sh"), "utf8");
   const symlinkResolution = launcher.indexOf('while [[ -L "${source_path}" ]]; do');
@@ -175,6 +259,85 @@ test("the Linux launcher resolves installer-style symlinks before loading projec
   const optionHandling = launcher.indexOf('while (($#)); do');
   assert.ok(symlinkResolution >= 0 && helperSource > symlinkResolution && optionHandling > helperSource,
     "an installer-created shortcut outside the checkout resolves to the project before sourcing its helper or handling options");
+});
+
+test("CDP tunnel Start clears metadata only for a valid absent PID and a verified free port", async () => {
+  const source = await readFile(join(process.cwd(), "scripts/steam-deck-cdp-tunnel.ps1"), "utf8");
+  const portCheck = source.slice(source.indexOf("function Test-LocalPortOccupied"), source.indexOf("function Get-StateRecord"));
+  assert.match(portCheck, /Get-NetTCPConnection -State Listen -ErrorAction Stop/,
+    "listener lookup must succeed even when the requested port has no matches");
+  assert.doesNotMatch(portCheck, /Get-NetTCPConnection[^\r\n]*-LocalPort/,
+    "the port filter must run on the successful listener collection, not inside Get-NetTCPConnection");
+  assert.match(portCheck, /Where-Object \{ \[int\]\$_\.LocalPort -eq \$LocalPort \}/);
+  assert.match(portCheck, /return \(\$matchingListeners\.Count -gt 0\)/,
+    "a successful listener query with no matching port must report the port as free");
+  const sampleListeners = [{ LocalPort: 9223 }, { LocalPort: 8787 }];
+  assert.equal(sampleListeners.filter(({ LocalPort }) => LocalPort === 9222).length > 0, false,
+    "an empty filtered listener collection is the verified free-port path");
+  assert.match(portCheck, /Unable to verify whether local port \$LocalPort is occupied/,
+    "a failed port lookup must stop instead of assuming the port is free");
+  assert.doesNotMatch(portCheck, /return \$false/,
+    "port-query errors must not be treated as positive evidence that the listener is absent");
+
+  const start = source.slice(source.indexOf("function Invoke-Start"), source.indexOf("function Invoke-Status"));
+  assert.match(start, /Assert-ValidStateRecord -Record \$priorRecord/,
+    "malformed state is rejected before process or metadata changes");
+  assert.match(start, /Get-CimInstance Win32_Process -Filter "ProcessId = \$recordPid" -ErrorAction Stop/,
+    "PID lookup must distinguish an absent process from lookup errors");
+  assert.match(start, /Unable to determine whether recorded PID \$recordPid exists/,
+    "an unavailable process lookup fails closed");
+  const processExists = start.indexOf("if ($null -ne $recordedProcess)");
+  const portRecheck = start.indexOf("if (Test-LocalPortOccupied)", processExists);
+  const stateRemoval = start.indexOf("Remove-StateFile", portRecheck);
+  const normalStart = start.indexOf("$sshCommand = Get-Command ssh.exe", stateRemoval);
+  assert.ok(processExists >= 0 && portRecheck > processExists && stateRemoval > portRecheck && normalStart > stateRemoval,
+    "only confirmed absence plus a second free-port check may clear stale metadata before normal Start proceeds");
+  assert.match(start.slice(processExists, portRecheck), /Recorded PID \$recordPid exists[\s\S]*?no process or metadata was changed/,
+    "a present but unowned PID preserves the existing record and process");
+  assert.match(source, /Tunnel state metadata is malformed[\s\S]*?no process or metadata was changed/);
+});
+
+test("Test-LocalPortOccupied handles mocked listener results and query failures", {
+  skip: process.platform === "win32" ? false : "PowerShell listener function harness requires Windows",
+}, () => {
+  const scriptPath = join(process.cwd(), "scripts/steam-deck-cdp-tunnel.ps1").replace(/'/g, "''");
+  const harness = `
+$scriptPath = '${scriptPath}'
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { throw 'Unable to parse tunnel script' }
+$functionAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-LocalPortOccupied' }, $true)
+if ($null -eq $functionAst) { throw 'Test-LocalPortOccupied was not found' }
+. ([scriptblock]::Create($functionAst.Extent.Text))
+$LocalPort = 9222
+$script:MockListeners = @()
+$script:MockQueryError = $false
+function Get-NetTCPConnection {
+  if ($script:MockQueryError) { throw 'mock listener query failure' }
+  return $script:MockListeners
+}
+if (Test-LocalPortOccupied) { throw 'empty listener collection must report free' }
+$script:MockListeners = @([pscustomobject]@{ LocalPort = 9223 }, [pscustomobject]@{ LocalPort = 8787 })
+if (Test-LocalPortOccupied) { throw 'listeners on other ports must report free' }
+$script:MockListeners = @([pscustomobject]@{ LocalPort = 9222 })
+if (-not (Test-LocalPortOccupied)) { throw 'listener on configured port must report occupied' }
+$script:MockQueryError = $true
+try {
+  [void](Test-LocalPortOccupied)
+  throw 'listener query errors must fail closed'
+} catch {
+  if ($_.Exception.Message -notmatch 'Unable to verify whether local port 9222 is occupied') { throw }
+}
+Write-Output 'mock listener behavior OK'
+`;
+  const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", harness], {
+    encoding: "utf8",
+    timeout: 15_000,
+  });
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /mock listener behavior OK/);
 });
 
 test("the Windows launcher refuses a second local bridge without shutting down the active one", async () => {
@@ -479,7 +642,7 @@ test("SSH forwarding policy failures show the SSH diagnostic without claiming an
   assert.equal(exitCode, 1);
 });
 
-test("an unidentified forwarding conflict gets one delayed, non-interactive retry while the same bridge owns the port", { timeout: 30_000 }, async (t) => {
+test("an unidentified forwarding conflict retries non-interactively while the same bridge owns the port", { timeout: 30_000 }, async (t) => {
   if (process.platform !== "win32") return t.skip("Windows PowerShell tunnel supervisor test");
 
   const bridge = createServer();
@@ -501,7 +664,7 @@ exit 255
   const child = spawn(powershell, [
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
     "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port),
-    "-RecoveryDelaySeconds", "1", "-SshExecutable", powershell,
+    "-RecoveryDelaySeconds", "1", "-RecoveryWindowSeconds", "1", "-SshExecutable", powershell,
     "-SshArgumentsOverrideBase64", failureOverride,
     "-DiagnosticProbeOverrideBase64", unknownProbeOverride
   ], { stdio: ["pipe", "pipe", "pipe"] });
@@ -519,7 +682,7 @@ exit 255
     WINDOWS_PROCESS_STARTUP_BUDGET_MS * 4 + 3_000
   );
   assert.ok(Date.now() - startedAt >= 900, "the retry waits for the configured expiry interval");
-  assert.match(output.output, /same local bridge process is still active; making one non-interactive SSH forwarding retry/);
+  assert.match(output.output, /same local bridge process is still active; starting non-interactive SSH retries within the bounded recovery window/);
   assert.match(output.output, /port may still be occupied/);
   child.stdin.write("\r\n");
   const [exitCode] = await once(child, "close");
@@ -552,7 +715,7 @@ exit 255
   const child = spawn(powershell, [
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
     "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port),
-    "-RecoveryDelaySeconds", "1", "-SshExecutable", powershell,
+    "-RecoveryDelaySeconds", "1", "-RecoveryWindowSeconds", "1", "-SshExecutable", powershell,
     "-SshArgumentsOverrideBase64", sshOverride,
     "-DiagnosticProbeOverrideBase64", unknownProbeOverride
   ], { stdio: ["pipe", "pipe", "pipe"] });
@@ -597,7 +760,7 @@ exit 255
   const child = spawn(powershell, [
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
     "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port),
-    "-RecoveryDelaySeconds", "1", "-SshExecutable", powershell,
+    "-RecoveryDelaySeconds", "1", "-RecoveryWindowSeconds", "1", "-SshExecutable", powershell,
     "-SshArgumentsOverrideBase64", sshOverride,
     "-DiagnosticProbeOverrideBase64", unknownProbeOverride
   ], { stdio: ["pipe", "pipe", "pipe"] });
@@ -653,7 +816,7 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   const supervisor = spawn(powershell, [
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
     "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port),
-    "-RecoveryDelaySeconds", "1", "-SshExecutable", powershell,
+    "-RecoveryDelaySeconds", "1", "-RecoveryWindowSeconds", "1", "-SshExecutable", powershell,
     "-SshArgumentsOverrideBase64", sshOverride,
     "-DiagnosticProbeOverrideBase64", unknownProbeOverride
   ], { stdio: ["pipe", "pipe", "pipe"] });
@@ -672,7 +835,7 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   const output = watchOutput(supervisor);
   await waitForFile(sshPidPath, WINDOWS_RECOVERY_STAGE_WAIT_MS, supervisor);
   assert.equal(supervisor.exitCode, null, "the retry process remains under supervision until the bridge stops");
-  assert.match(output.output, /making one non-interactive SSH forwarding retry/);
+  assert.match(output.output, /starting non-interactive SSH retries within the bounded recovery window/);
   assert.equal((await readFile(callsPath, "utf8")).trim().split(/\r?\n/).length, 2);
   await closeBridge();
   const [exitCode] = supervisor.exitCode !== null ? [supervisor.exitCode] : await once(supervisor, "close");
@@ -718,7 +881,7 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   const supervisor = spawn(powershell, [
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
     "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port),
-    "-RecoveryDelaySeconds", "1", "-SshExecutable", powershell,
+    "-RecoveryDelaySeconds", "1", "-RecoveryWindowSeconds", "1", "-SshExecutable", powershell,
     "-SshArgumentsOverrideBase64", sshOverride,
     "-DiagnosticProbeOverrideBase64", unknownProbeOverride
   ], { stdio: ["pipe", "pipe", "pipe"] });
@@ -937,7 +1100,7 @@ server.listen(Number(portText), '127.0.0.1', () => {
       const child = spawn(powershell, [
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
         "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port),
-        "-RecoveryDelaySeconds", "1",
+        "-RecoveryDelaySeconds", "1", "-RecoveryWindowSeconds", "1",
         "-SshExecutable", process.execPath, "-SshArgumentsOverrideBase64", failureOverride,
         "-DiagnosticProbeOverrideBase64", probeOverride
       ], { stdio: ["pipe", "pipe", "pipe"] });
@@ -966,11 +1129,13 @@ server.listen(Number(portText), '127.0.0.1', () => {
         await waitForProcessGone(pid);
         assert.equal((await readFile(ownerPath, "utf8")).trim(), "existing-Deck-service", "the probe did not remove or alter the responding service marker");
       }
-      child.stdin.write("\r\n");
+      if (scenario.mode === "decky" || scenario.mode === "other") {
+        await acknowledgeAfterCloseNotice(output, child);
+      }
       const [exitCode] = await once(child, "close");
       assert.equal(exitCode, 1);
       if (scenario.mode === "decky") assert.match(output.output, /Close the existing connection before starting another/);
-      if (scenario.mode === "unknown") assert.match(output.output, /making one non-interactive SSH forwarding retry/);
+      if (scenario.mode === "unknown") assert.match(output.output, /starting non-interactive SSH retries within the bounded recovery window/);
     }
   } finally {
     for (const child of supervisors) acknowledgeChild(child);
@@ -1050,7 +1215,7 @@ while ($true) { Start-Sleep -Milliseconds 100 }
     const child = spawn(powershell, [
       "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
       "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port),
-      "-RecoveryDelaySeconds", "1",
+      "-RecoveryDelaySeconds", "1", "-RecoveryWindowSeconds", "1",
       "-SshExecutable", powershell, "-SshArgumentsOverrideBase64", overridesFor(session)
     ], { stdio: ["pipe", "pipe", "pipe"] });
     const output = watchOutput(child);
@@ -1066,7 +1231,7 @@ while ($true) { Start-Sleep -Milliseconds 100 }
     b.output.waitFor(conflictMessage).then(() => ({ loser: b, winner: a }))
   ]);
   assert.equal(conflictWinner.loser.child.exitCode, null, "conflict waits for visible acknowledgement");
-  conflictWinner.loser.child.stdin.write("\r\n");
+  await waitForNonInteractiveStop(conflictWinner.loser.output);
   const [loserExitCode] = await once(conflictWinner.loser.child, "close");
   assert.equal(loserExitCode, 1);
   assert.doesNotMatch(conflictWinner.loser.output.output, /Retrying in 3 seconds/);
@@ -1090,7 +1255,7 @@ while ($true) { Start-Sleep -Milliseconds 100 }
   await conflictWinner.winner.output.waitFor(conflictMessage);
   assert.equal(conflictWinner.winner.child.exitCode, null, "the conflict remains visible until acknowledged");
   assert.equal(c.child.exitCode, null, "the reconnecting original did not displace the new winner");
-  conflictWinner.winner.child.stdin.write("\r\n");
+  await waitForNonInteractiveStop(conflictWinner.winner.output);
   const [reconnectExitCode] = await once(conflictWinner.winner.child, "close");
   assert.equal(reconnectExitCode, 1);
   assert.equal((await readFile(ownerPath, "utf8")).trim(), "C");
@@ -1164,7 +1329,7 @@ while ($true) { Start-Sleep -Milliseconds 100 }
     const child = spawn(powershell, [
       "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tunnelScript,
       "-DeckUser", "deck", "-DeckHost", "steamdeck.test", "-BridgePort", String(address.port),
-      "-RecoveryDelaySeconds", "1",
+      "-RecoveryDelaySeconds", "1", "-RecoveryWindowSeconds", "1",
       "-SshExecutable", powershell, "-SshArgumentsOverrideBase64", overridesFor(session)
     ], { stdio: ["pipe", "pipe", "pipe"] });
     const output = watchOutput(child);
@@ -1198,7 +1363,7 @@ while ($true) { Start-Sleep -Milliseconds 100 }
     waitForFile(join(directory, `${losingSession}-attempt-2.started`), DEFAULT_FILE_WAIT_MS, conflictLoser.child)
   ]);
   await waitForFile(join(directory, `${losingSession}-attempt-3.started`), WINDOWS_RECOVERY_STAGE_WAIT_MS, conflictLoser.child);
-  conflictLoser.child.stdin.write("\r\n");
+  await waitForNonInteractiveStop(conflictLoser.output);
   const [loserExitCode] = await once(conflictLoser.child, "close");
   assert.equal(loserExitCode, 1);
   assert.equal(winner.child.exitCode, null, "the losing reconnect did not displace or stop the winner");

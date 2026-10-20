@@ -1,6 +1,6 @@
-import type { IncomingMessage } from "./types/message";
+import type { IncomingMessage } from "../types/message";
 
-export type MessageYAction = "toggle-audio";
+export type MessageYAction = "toggle-audio" | "toggle-video";
 
 export interface MessageYPressOptions {
   isTextEntryFocused: () => boolean;
@@ -16,8 +16,11 @@ export function createMessageYPressHandler(options: MessageYPressOptions) {
   };
 }
 
-/** Images remain inline; only playable audio has a Y action. */
+/** Images remain inline; Y toggles playback only for supported audio and ordinary video. */
 export function getMessageYAction(message?: IncomingMessage): MessageYAction | undefined {
   const media = message?.media;
-  return media?.kind === "audio" && media.dataUrl ? "toggle-audio" : undefined;
+  if (!media?.dataUrl || message?.viewOnce) return undefined;
+  if (media.kind === "audio") return "toggle-audio";
+  if (media.kind === "video") return "toggle-video";
+  return undefined;
 }

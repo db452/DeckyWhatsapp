@@ -9,7 +9,8 @@ function Stop-Deploy([string] $Message) {
 
 function Invoke-Checked([string] $File, [string[]] $Arguments, [string] $Description) {
     if ($File -ieq 'ssh.exe' -or $File -ieq 'scp.exe') {
-        $null = Invoke-BoundedProcess $File $Arguments $Description $RemoteCommandTimeoutSeconds $script:remoteStage
+        $inheritOutput = $File -ieq 'scp.exe'
+        $null = Invoke-BoundedProcess $File $Arguments $Description $RemoteCommandTimeoutSeconds $script:remoteStage $inheritOutput
         return
     }
     Write-Host "$Description..."
@@ -154,8 +155,8 @@ try {
     }
     $remote = "deck@$deckHost"
     $remoteStage = "/home/deck/decky-whatsapp-deploy-$stamp"
-    $sshOptions = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ConnectionAttempts=1')
-    $scpOptions = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ConnectionAttempts=1')
+    $sshOptions = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ConnectionAttempts=1', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3')
+    $scpOptions = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ConnectionAttempts=1', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3')
 
     Write-Host "Selected Deck host: $remote"
     Invoke-Checked 'ssh.exe' ($sshOptions + @($remote, 'true')) 'Deck SSH connectivity check'
@@ -223,7 +224,8 @@ fi
     Invoke-Checked 'scp.exe' ($scpOptions + @($localPreflight, "$remote`:$preflightRemote")) 'Deck preflight script transfer'
     Invoke-Checked 'ssh.exe' ($sshOptions + @($remote, "bash -n '$preflightRemote' && bash '$preflightRemote'")) 'Deck path and identity preflight'
 
-    Invoke-Checked 'scp.exe' ($scpOptions + @('-r', $productionArtifact, $mockArtifact, "$remote`:$remoteStage/")) 'Plugin artifact transfer'
+    Invoke-Checked 'scp.exe' ($scpOptions + @('-r', $productionArtifact, "$remote`:$remoteStage/")) 'Production plugin artifact transfer'
+    Invoke-Checked 'scp.exe' ($scpOptions + @('-r', $mockArtifact, "$remote`:$remoteStage/")) 'MOCK plugin artifact transfer'
     Invoke-Checked 'scp.exe' ($scpOptions + @((Join-Path $productionArtifact 'SHA256SUMS'), "$remote`:$remoteStage/decky-whatsapp/")) 'Production hash manifest transfer'
     Invoke-Checked 'scp.exe' ($scpOptions + @((Join-Path $mockArtifact 'SHA256SUMS'), "$remote`:$remoteStage/decky-whatsapp-mock/")) 'MOCK hash manifest transfer'
 

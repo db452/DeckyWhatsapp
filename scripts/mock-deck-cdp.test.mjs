@@ -15,10 +15,12 @@ import {
   formatCliError,
   inspectTarget,
   isForbiddenRequest,
+  isNotificationToastsTarget,
   isQuickAccessTarget,
   loadStrictCdpClient,
   sanitizeException,
   selectQuickAccessTarget,
+  selectNotificationToastsTarget,
   validateTargetSocket
 } from './mock-deck-cdp.mjs';
 
@@ -27,6 +29,7 @@ function fakeClient({ valid = true, label = 'MOCK / OFFLINE', hitControl = true,
   const eventHandlers = {};
   let scrolled = false;
   let scopeQueries = 0;
+  let reactionControlResolved = false;
   const client = {
     calls,
     DOM: {
@@ -42,21 +45,38 @@ function fakeClient({ valid = true, label = 'MOCK / OFFLINE', hitControl = true,
         if (isControl && changedControlAfterScroll && scrolled) return { nodeId: 9 };
         return { nodeId: isControl && !(missingControlAfterScroll && scrolled) ? 3 : 0 };
       },
-      async describeNode({ nodeId }) {
+      async describeNode({ nodeId, depth }) {
         calls.push(['describeNode', nodeId]);
         const isScope = nodeId === 2 || nodeId === 8;
         const isControl = nodeId === 3 || nodeId === 9;
         const currentControlId = changedControlAfterScroll && scrolled ? 9 : 3;
+        if (nodeId === 2 && depth === -1) reactionControlResolved = true;
         return { node: {
           ...(isScope ? {
             backendNodeId: nodeId === 8 && changedBackendScopeAfterScroll ? 201 : 200,
             attributes: ['data-decky-provider', 'mock', 'data-decky-label', label, 'data-decky-scope', 'mock-panel', 'aria-label', label]
           } : {}),
+          ...(nodeId === 2 && depth === -1 ? { children: [{
+            nodeId: 0,
+            nodeType: 1,
+            nodeName: 'BUTTON',
+            localName: 'button',
+            backendNodeId: 400,
+            children: [{ nodeId: 7, nodeType: 3, nodeName: '#text', nodeValue: 'Simulate reaction to your message', backendNodeId: 401 }]
+          }] } : {}),
           ...(isControl ? { backendNodeId: nodeId === 9 && changedBackendControlAfterScroll ? 301 : 300 } : {}),
-          ...(nodeId === 4 ? { parentId: hitControl ? currentControlId : 99 } : nodeId === 3 || nodeId === 9 ? { parentId: 2 } : {})
+          ...(nodeId === 4 ? { parentId: hitControl ? currentControlId : 99 }
+            : nodeId === 3 || nodeId === 9 ? { parentId: 2 }
+              : nodeId === 6 ? { backendNodeId: 400, nodeName: 'BUTTON', localName: 'button', parentId: 2 }
+                : nodeId === 7 ? { parentId: reactionControlResolved ? 6 : currentControlId } : {})
         } };
       },
-      async getNodeForLocation({ x, y }) { calls.push(['getNodeForLocation', x, y]); return { nodeId: 4 }; },
+      async pushNodesByBackendIdsToFrontend({ backendNodeIds }) {
+        calls.push(['pushNodesByBackendIdsToFrontend', backendNodeIds]);
+        return { nodeIds: backendNodeIds.map((backendNodeId) => backendNodeId === 400 ? 6 : 0) };
+      },
+      async performSearch({ query }) { calls.push(['performSearch', query]); return { searchId: 'reaction', resultCount: 1 }; },
+      async getNodeForLocation({ x, y }) { calls.push(['getNodeForLocation', x, y]); return { nodeId: reactionControlResolved ? 7 : 4 }; },
       async getBoxModel({ nodeId }) { calls.push(['getBoxModel', nodeId]); return { model: { border: [10, 20, 30, 20, 30, 40, 10, 40] } }; },
       async scrollIntoViewIfNeeded({ nodeId }) { calls.push(['scrollIntoViewIfNeeded', nodeId]); scrolled = true; }
     },
@@ -86,14 +106,16 @@ test('CDP discovery accepts only loopback and returns only page targets', async 
     requestOptions = options;
     return { ok: true, json: async () => [
       { id: 'quick', type: 'page', title: 'QuickAccess_uid2', url: 'http://steam/quick' },
+      { id: 'toasts', type: 'page', title: 'notificationtoasts_uid2', url: 'http://steam/notificationtoasts' },
       { id: 'game', type: 'page', title: 'Game', url: 'http://steam/game' },
       { id: 'worker', type: 'service_worker', title: 'QuickAccess_uid2', url: 'http://steam/quick' }
     ] };
   });
   assert.deepEqual(seen, ['http://127.0.0.1:9222/json/list']);
   assert.equal(requestOptions.redirect, 'error');
-  assert.equal(targets.length, 1);
+  assert.equal(targets.length, 2);
   assert.equal(selectQuickAccessTarget(targets).id, 'quick');
+  assert.equal(selectNotificationToastsTarget(targets).id, 'toasts');
   await assert.rejects(() => discoverTargets('http://192.168.1.5:9222', async () => ({ ok: true, json: async () => [] })), /loopback/);
   await assert.rejects(() => discoverTargets('http://127.0.0.1:9222', async () => ({
     ok: true, redirected: true, url: 'http://192.0.2.5:9222/json/list', json: async () => []
@@ -218,6 +240,15 @@ test('Quick Access selection rejects missing or ambiguous targets', () => {
   ]), /Multiple/);
 });
 
+test('notification toast target selection requires one exact Steam notification page', () => {
+  const target = { id: 'toasts', type: 'page', title: 'notificationtoasts_uid2' };
+  assert.equal(isNotificationToastsTarget(target), true);
+  assert.equal(isNotificationToastsTarget({ ...target, title: 'Game' }), false);
+  assert.equal(selectNotificationToastsTarget([target]).id, 'toasts');
+  assert.throws(() => selectNotificationToastsTarget([]), /not found/);
+  assert.throws(() => selectNotificationToastsTarget([target, { ...target, id: 'other' }]), /Multiple/);
+});
+
 test('MOCK marker and visible label failure stops before input dispatch', async () => {
   const client = fakeClient({ valid: false });
   await assert.rejects(() => exerciseMock(client, 'start'), /MOCK panel scope is absent/);
@@ -258,6 +289,14 @@ test('allowed MOCK action clicks only an exactly matched control inside the veri
   assert.ok(boundsIndex > refreshedControlIndex, 'click bounds are read only after revalidation');
   assert.ok(clickIndex > boundsIndex, 'input is dispatched only after hit testing');
   await assert.rejects(() => exerciseMock(client, 'send-live-message'), /Unsupported/);
+
+  const reaction = fakeClient();
+  const reactionOutcome = await exerciseMock(reaction, 'simulate-reaction');
+  assert.deepEqual(reactionOutcome, { exercised: 'simulate-reaction', mockGuard: true });
+  assert.ok(reaction.calls.some(([name, nodeId]) => name === 'describeNode' && nodeId === 2), 'reaction text is resolved inside the verified MOCK scope');
+  assert.ok(reaction.calls.some(([name, backendIds]) => name === 'pushNodesByBackendIdsToFrontend' && backendIds[0] === 400), 'the button is resolved to a current frontend node before input dispatch');
+  assert.equal(reaction.calls.some(([name]) => name === 'performSearch'), false, 'text lookup does not depend on parent IDs returned for CEF search nodes');
+  assert.equal(reaction.calls.filter(([name]) => name === 'mouse').length, 2, 'reaction simulation must click only the guarded MOCK control');
 
   const overlay = fakeClient({ hitControl: false });
   await assert.rejects(() => exerciseMock(overlay, 'start'), /not the hit-tested target/);

@@ -38,6 +38,7 @@ releases/
 /artifacts/decky-whatsapp-update-*/
 /artifacts/decky-whatsapp-*-update-*/
 /artifacts/decky-whatsapp-mock-cdp-*/
+/artifacts/decky-whatsapp-video-windows-companion-*/
 /decky-plugin/.mock-build/
 .DS_Store
 Thumbs.db

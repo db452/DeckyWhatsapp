@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:9222';
 const MOCK_SCOPE_SELECTOR = '[data-decky-provider="mock"][data-decky-label="MOCK / OFFLINE"][data-decky-scope="mock-panel"]';
 const FORBIDDEN_HOSTS = new Set(['web.whatsapp.com', 'whatsapp.com', 'whatsapp.net', 'mmg.whatsapp.net']);
-const SAFE_EXERCISES = new Set(['start', 'stop', 'open-ava']);
+const SAFE_EXERCISES = new Set(['start', 'stop', 'open-ava', 'simulate-reaction']);
 const CONNECT_TIMEOUT_MS = 5000;
 const COMMAND_TIMEOUT_MS = 5000;
 const OPERATION_TIMEOUT_MS = 30000;
@@ -33,7 +33,7 @@ export async function discoverTargets(endpoint = DEFAULT_ENDPOINT, fetchImpl = f
     if (!response.ok) throw new Error(`CDP target discovery failed (HTTP ${response.status}).`);
     const targets = await response.json();
     if (!Array.isArray(targets)) throw new Error('CDP target discovery returned an invalid response.');
-    return targets.filter((target) => target?.type === 'page' && isQuickAccessTarget(target));
+    return targets.filter((target) => target?.type === 'page' && (isQuickAccessTarget(target) || isNotificationToastsTarget(target)));
   }, CONNECT_TIMEOUT_MS, 'CDP discovery timed out.', () => controller.abort());
 }
 
@@ -42,9 +42,20 @@ export function isQuickAccessTarget(target) {
     (target.title === 'QuickAccess_uid2' || /(?:^|\/)QuickAccess_uid2(?:[/?#]|$)/.test(target.url || ''));
 }
 
+export function isNotificationToastsTarget(target) {
+  return typeof target?.id === 'string' &&
+    (target.title === 'notificationtoasts_uid2' || /(?:^|\/)notificationtoasts_uid2(?:[/?#]|$)/.test(target.url || ''));
+}
+
 export function selectQuickAccessTarget(targets) {
   const matches = targets.filter(isQuickAccessTarget);
   if (matches.length !== 1) throw new Error(matches.length ? 'Multiple Quick Access targets found; refusing to choose.' : 'Quick Access target not found.');
+  return matches[0];
+}
+
+export function selectNotificationToastsTarget(targets) {
+  const matches = targets.filter(isNotificationToastsTarget);
+  if (matches.length !== 1) throw new Error(matches.length ? 'Multiple notification toast targets found; refusing to choose.' : 'Notification toast target not found.');
   return matches[0];
 }
 
@@ -54,7 +65,7 @@ export function validateTargetSocket(target, endpoint) {
   const endpointPort = endpointUrl.port || '80';
   if (socketUrl.protocol !== 'ws:' || socketUrl.hostname !== endpointUrl.hostname || socketUrl.port !== endpointPort ||
       socketUrl.username || socketUrl.password || socketUrl.search || socketUrl.hash) {
-    throw new Error('Quick Access debugger socket does not match the validated loopback endpoint.');
+    throw new Error('Page debugger socket does not match the validated loopback endpoint.');
   }
   return Object.freeze({ ...target });
 }
@@ -170,6 +181,8 @@ const SAFE_CLI_ERRORS = new Set([
   'Unsupported CDP client version; refusing an unverified transport.',
   'Quick Access target not found.',
   'Multiple Quick Access targets found; refusing to choose.',
+  'Notification toast target not found.',
+  'Multiple notification toast targets found; refusing to choose.',
   'Verified MOCK panel scope is absent; no UI action was taken.',
   'Verified MOCK panel identity changed after scrolling; no UI action was taken.',
   'Verified MOCK control identity changed after scrolling; no UI action was taken.',
@@ -218,6 +231,43 @@ async function findControl(client, scopeNodeId, selector) {
   return { nodeId, backendNodeId: node.backendNodeId };
 }
 
+async function findExactTextControl(client, scopeNodeId, text) {
+  // Search results can be text nodes without parent IDs in Steam's CEF. Walk
+  // only the already-verified MOCK subtree so exact text can be tied safely to
+  // its clickable button without page-script evaluation.
+  const { node: scope } = await cdpCommand(client, 'DOM', 'describeNode', {
+    nodeId: scopeNodeId,
+    depth: -1,
+    pierce: true
+  });
+  const matches = [];
+  const textContent = (node) => {
+    if (node.nodeType === 3) return node.nodeValue || '';
+    const children = [
+      ...(node.children || []),
+      ...(node.shadowRoots || [])
+    ];
+    return children.map(textContent).join('');
+  };
+  const visit = (node) => {
+    if ((node.localName === 'button' || node.nodeName === 'BUTTON') && textContent(node).trim() === text &&
+        Number.isInteger(node.backendNodeId) && node.backendNodeId > 0) {
+      matches.push({ backendNodeId: node.backendNodeId });
+    }
+    for (const child of node.children || []) visit(child);
+    for (const shadowRoot of node.shadowRoots || []) visit(shadowRoot);
+  };
+  visit(scope);
+  if (matches.length !== 1) throw new Error('Requested MOCK control is unavailable.');
+  const { nodeIds } = await cdpCommand(client, 'DOM', 'pushNodesByBackendIdsToFrontend', {
+    backendNodeIds: [matches[0].backendNodeId]
+  });
+  if (!Number.isInteger(nodeIds?.[0]) || nodeIds[0] <= 0) {
+    throw new Error('Could not verify stable MOCK node identity; no UI action was taken.');
+  }
+  return { nodeId: nodeIds[0], backendNodeId: matches[0].backendNodeId };
+}
+
 async function clickNode(client, nodeId) {
   const { model } = await cdpCommand(client, 'DOM', 'getBoxModel', { nodeId });
   const [x1, y1, x2, y2, x3, y3, x4, y4] = model.border;
@@ -245,7 +295,10 @@ export async function exerciseMock(client, exercise) {
     'open-ava': '[data-decky-action="open-ava"] button'
   };
   const verifiedScope = await getMockScope(client);
-  const verifiedControl = await findControl(client, verifiedScope.nodeId, controls[exercise]);
+  const findRequestedControl = (scopeNodeId) => exercise === 'simulate-reaction'
+    ? findExactTextControl(client, scopeNodeId, 'Simulate reaction to your message')
+    : findControl(client, scopeNodeId, controls[exercise]);
+  const verifiedControl = await findRequestedControl(verifiedScope.nodeId);
   // Only scroll a control after querying it beneath the verified MOCK scope.
   await cdpCommand(client, 'DOM', 'scrollIntoViewIfNeeded', { nodeId: verifiedControl.nodeId });
 
@@ -255,12 +308,36 @@ export async function exerciseMock(client, exercise) {
   if (refreshedScope.backendNodeId !== verifiedScope.backendNodeId) {
     throw new Error('Verified MOCK panel identity changed after scrolling; no UI action was taken.');
   }
-  const refreshedControl = await findControl(client, refreshedScope.nodeId, controls[exercise]);
+  const refreshedControl = await findRequestedControl(refreshedScope.nodeId);
   if (refreshedControl.backendNodeId !== verifiedControl.backendNodeId) {
     throw new Error('Verified MOCK control identity changed after scrolling; no UI action was taken.');
   }
   await clickNode(client, refreshedControl.nodeId);
   return { exercised: exercise, mockGuard: true };
+}
+
+async function hasVisibleText(client, query) {
+  const { searchId, resultCount } = await cdpCommand(client, 'DOM', 'performSearch', {
+    query,
+    includeUserAgentShadowDOM: true
+  });
+  if (!searchId) return false;
+  try { return resultCount > 0; }
+  finally { await cdpCommand(client, 'DOM', 'discardSearchResults', { searchId }); }
+}
+
+async function reactionToastVisible(client) {
+  await cdpCommand(client, 'DOM', 'enable');
+  return await hasVisibleText(client, 'Reaction to your message') && await hasVisibleText(client, '🌱');
+}
+
+async function waitForReactionToast(client, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await reactionToastVisible(client)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
 }
 
 export async function inspectTarget(client, { exercise } = {}) {
@@ -322,21 +399,37 @@ export function loadStrictCdpClient() {
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
-    console.log('Read-only by default. Options: --endpoint http://127.0.0.1:9222, --exercise start|stop|open-ava');
+    console.log('Read-only by default. Options: --endpoint http://127.0.0.1:9222, --exercise start|stop|open-ava|simulate-reaction');
     return;
   }
   const origin = safeEndpoint(options.endpoint);
   const { CDP, sockets } = loadStrictCdpClient();
   let client;
+  let toastClient;
   try {
     const result = await boundedCdpOperation(async () => {
       const targets = await discoverTargets(origin);
       const target = validateTargetSocket(selectQuickAccessTarget(targets), origin);
       client = await connectBounded(() => CDP({ target, local: true }), { sockets });
-      return inspectTarget(client, { exercise: options.exercise });
+      if (options.exercise === 'simulate-reaction') {
+        const toastTarget = validateTargetSocket(selectNotificationToastsTarget(targets), origin);
+        toastClient = await connectBounded(() => CDP({ target: toastTarget, local: true }), { sockets });
+        if (await reactionToastVisible(toastClient)) {
+          throw new Error('A prior MOCK reaction toast is still visible; wait for it to clear before testing again.');
+        }
+      }
+      const inspection = await inspectTarget(client, { exercise: options.exercise });
+      if (options.exercise === 'simulate-reaction') {
+        const visible = await waitForReactionToast(toastClient);
+        inspection.reactionToast = visible
+          ? { visible: true, title: 'Reaction to your message', emoji: '🌱' }
+          : { visible: false };
+      }
+      return inspection;
     }, { sockets, getClient: () => client });
     console.log(JSON.stringify({ target: 'QuickAccess_uid2', ...result }, null, 2));
   } finally {
+    await closeClientBounded(toastClient, sockets);
     await closeClientBounded(client, sockets);
   }
 }

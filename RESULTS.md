@@ -4,6 +4,30 @@ This file holds detailed evidence moved from `PLAN.md`; the plan remains the sou
 
 ## Automated tests
 
+### Phase 7 ordinary video — 2026-10-18
+
+- Ordinary incoming WhatsApp videos now receive `[Video]` fallback text, typed `video` media, and bounded MP4/WebM download support. MIME validation is specific to media kind, strips codecs parameters, rejects image/audio payloads and unsupported video formats, and keeps GIF-marked video classified as GIF. The existing 12 MB limit, cache bounds, and view-once no-download behavior remain in place.
+- The plugin renders ordinary video with native controls and `preload="metadata"`; it does not autoplay. The offline MOCK contains a fabricated 2,366-byte WebM. Its active React mount test checks the EBML signature/size, source, controls, no-autoplay behavior, unavailable fallback, and that view-once media exposes no video player/retry action.
+- A local Puppeteer Chromium run recorded a synthetic 160×90 canvas at 10 fps as `video/webm`, then loaded the generated Blob into a Chromium `<video>` element and awaited `loadeddata`. The browser reported 1.211128 seconds, 160×90 dimensions, 2,366 bytes, and sufficient ready state. The one-off generator wrote only to the Windows temp directory and was removed after embedding its base64 payload into the MOCK provider. No network or WhatsApp data was used.
+- `npm.cmd test` passed **115/115** using `NODE_OPTIONS=--import=<absolute file URL to scripts/mock-test-node-preload.mjs>`. A plain run first failed because this restricted Windows context returns `ENOMEM` from `os.userInfo()` before `tsx` loads. A run with a repository-relative preload passed 114/115; the remaining temporary-checkout test could not resolve that relative path. The absolute file URL preload resolved both environment issues.
+- `npm.cmd run test:mock` passed **12/12**; `node --import tsx --test src/whatsapp.test.ts` passed **25/25**. Root and plugin typechecks, the production Rollup build, MOCK build, and `git diff --check` passed. The MOCK artifact was rebuilt and its five runtime file hashes were verified before staging.
+- Independent review used all three permitted passes. Pass 1 required kind-specific MIME validation and a playable MOCK fixture; pass 2 confirmed MIME handling but still required the fixture; pass 3 returned **PASS** after the synthetic WebM was embedded and the updated MOCK tests passed. The reviewer independently reran the MOCK suite and both typechecks. Physical Deck playback and no-autoplay checks later passed; remaining physical checks are listed below.
+
+### Phase 7 follow-up — video controller and notification session — 2026-10-18
+
+- Y now starts or pauses ordinary video on the highlighted message; audio keeps its existing Y action, images and view-once video remain excluded, and text-entry focus suppresses the shortcut. The MOCK React mount simulates controller input and verifies play/pause. Independent review passed on pass 1; physical Y input remains unverified.
+- A background notification event is accepted only while the notifications setting, Deck connection setting, and event socket are active, and only when its valid Unix-second timestamp is at or after the current socket-session watermark. The watermark is cleared on disconnect/stop, so older messages surfaced after reconnect are ignored. The subscription remains open when Quick Access is closed.
+- The watermark rounds socket-open time up to the next whole second because WhatsApp message timestamps have second precision. This intentionally suppresses ambiguous events in the partial second when the socket opens; it assumes the Deck clock and WhatsApp timestamps are reasonably aligned.
+- Notification-session unit tests passed **4/4**. Independent review passed on pass 1; the reviewer ran notification-session, notification-ID-cache, and connection tests **14/14**, MOCK/provider tests **12/12**, plugin typecheck, and `git diff --check` (line-ending warnings only). The reviewer found no actionable issue; physical toast behavior remains unverified.
+- After adding the notification test to the root script, `npm.cmd test` passed **120/120** using `NODE_OPTIONS=--import=file:///C:/Users/dbett/Desktop/DeckyWhatsapp/scripts/mock-test-node-preload.mjs`. The implementation run also passed the plugin build and typecheck; the MOCK suite passed **12/12**.
+- The previous remote production-only stage at `/home/deck/decky-whatsapp-production-video-20261018-112613` predates these follow-up changes and must not be installed. The current `deploy-decky-plugins.bat` rebuilds and stages both reviewed variants, validates identities and hashes, then prompts for `DEPLOY` and sudo before changing either installed plugin. No current follow-up artifact has been staged or installed yet.
+
+### Phase 7 reaction notification fix — 2026-10-18
+
+- The bridge now forwards the reaction ID, actor attribution, parent-message `fromMe`, and reaction timestamp from the pinned WhatsApp library event. The plugin notifies only for a non-empty reaction from another participant on a user-authored message. It fails closed when attribution, event identity, or timestamp is missing, deduplicates reactions separately from messages, and uses the existing active-session, gaming, sound, and preview settings. No message body or contact content is included in the reaction toast.
+- Added a fabricated offline MOCK reaction event and focused eligibility/bridge tests. Validation reported by the explicitly invoked Fixer: focused bridge/reaction/session tests **31/31**, MOCK/provider tests **12/12**, root typecheck, plugin typecheck, plugin build, and `git diff --check` passed. Direct test startup required the repository preload because this Windows runner reports `ENOMEM` from `os.userInfo()`.
+- The Fixer workflow does not include an independent review pass. No live WhatsApp account was accessed, and no files were staged or deployed.
+
 ### Dated Windows/Linux companion packages — 2026-10-18
 
 - Ran `python scripts/package-companions.py --platform all --output-dir releases/2026-10-18`. The explicit platform allowlists produced `decky-whatsapp-pc-windows-v1.0.0.zip` and `decky-whatsapp-pc-linux-v1.0.0.zip`; the packager verified exact contents and excluded private/generated files.
@@ -139,6 +163,27 @@ This file holds detailed evidence moved from `PLAN.md`; the plan remains the sou
 
 ## Manual tests
 
+### Phase 7 ordinary video — 2026-10-18
+
+- **Install and isolation:** The user installed the staged MOCK-only artifact. Read-only verification found `plugin_loader.service` active, MOCK identity `Decky WhatsApp MOCK` / `decky-whatsapp-mock`, and all five installed runtime hashes matching the reviewed bundle: `plugin.json` `f0069bfe102e829426bca041f577bd1a2377bcbb1770d9292749fcbf1da5603a`, `package.json` `ea93c4086d9a92c7ec84367953504fbff17172b2607ca26ce953a83c5fcf851c`, `main.py` `cebdf0fb9dbbc65eb0f19ad04a93f18d66013b3e8f0e0fdfbef159f33198a93bf3`, `dist/index.js` `a7b4e06fc994d5ec2136f324e9e3c12412a68f141cca221139944d57bd9adf87`, and `dist/index.js.map` `82076b51080e21d6ce4211c194ce279cb06c6337f5a26c28900acb82a636d306`. The production plugin tree hash remains `12517be3ff25c86587a6ed960e43cdb9f0360a2e09a9818154246d5557af15ef`.
+- **Preflight and isolation:** Before interaction, the helper found no common game-runtime process names. `QuickAccess_uid2` contained the exact MOCK provider/label/scope marker. Sanitized diagnostics reported zero forbidden bridge/WhatsApp requests, zero console errors, and zero JavaScript exceptions. No production panel, conversation, data, or credentials were accessed.
+- **Playback:** Opened Ava's fabricated conversation and found exactly one `mock-ava-video` element labeled `mock-video.webm`. It had native controls, `preload="metadata"`, and no autoplay attribute; the player began paused with the play control visible. After playback, read-only player state reported `currentTime=1.211`, `duration=1.211`, `readyState=4`, `ended=true`, `paused=true`, `autoplay=false`, and no media error. The user also reported seeing the video move. A captured screenshot showed the fabricated offline video and native controls; temporary screenshots created for this check were removed. This verifies playback and no-autoplay, but not a separate controller-input path.
+- **Safe navigation tooling:** The existing helper's `open-ava` action failed closed because the CEF hit-test node omitted ancestry IDs. A bounded DOM check confirmed the hit-tested backend node was a descendant of the exact MOCK Ava button; the follow-up click was restricted to that target inside the validated MOCK panel. No repository code was changed for this test.
+- **Remaining manual checks:** Pause/resume through the player controls, controller navigation, playback-error fallback, and the physical view-once fallback/no-player behavior remain pending. Local automated MOCK tests cover the error and view-once fallback paths; no physical video error was induced.
+- **Next combined deployment:** `deploy-decky-plugins.bat` is the intended Windows workflow for rebuilding/staging both current variants and, after explicit `DEPLOY` plus the user's sudo entry, installing both and restarting `plugin_loader.service` once. Do not use the older production-only stage above.
+- **Pending controller and notification checks:** On MOCK, press Y to start, pause, and resume the fabricated ordinary video and confirm image/view-once exclusions. On production, the user should confirm that messages received while DeckyWhatsapp is disabled/offline do not create delayed toasts after reconnect, while a fresh incoming message during an active session can notify even with Quick Access closed. Codex did not connect to or interact with WhatsApp.
+- **Tunnel cleanup:** The tunnel helper's recorded process PID `15140` was absent when cleanup ran, so it stopped no process. The CDP endpoint still returned SteamUI targets but was not confirmed as owned by the helper; it was left untouched rather than risking termination of another session. The local helper metadata remains for inspection.
+
+### Phase 7 combined production and MOCK version check — 2026-10-18
+
+- Read-only SSH to `deck@steamdeck.lan` confirmed `plugin_loader.service` is active and both installed plugin directories are real directories at their expected paths. Production identity is `Decky WhatsApp` / `decky-whatsapp`, package `decky-whatsapp-plugin`, ESM; MOCK identity is `Decky WhatsApp MOCK` / `decky-whatsapp-mock`, package `decky-whatsapp-mock`, ESM.
+- Compared all five runtime file SHA-256 values for each installed variant with local artifact `artifacts/decky-whatsapp-deploy-20261018-114509-439`; every file matched. Production hashes: `plugin.json` `74626aa21c364187250dddf6d816d536272445c4d65767ddbcda71b204ecf6df`, `package.json` `cfe3e157d73fa7b1ed2cb6e4a697941d629cf4f3922076196f6953c640c1148f`, `main.py` `a81823cb4d6b779f11fe5b996532c50953473cc6b6ed1444934fc7a39ffacb21`, `dist/index.js` `c2878abd1a4571b2388dcb10040920b54a71940cddd069df2ee55035bbc8b792`, `dist/index.js.map` `5a3ea6b234bddd554b85768088fdc1bd6f1afb215cad1e5d1fbebadee705e75b`. MOCK hashes: `plugin.json` `f0069bfe102e829426bca041f577bd1a2377bcbb1770d9292749fcbf1da5603a`, `package.json` `ea93c4086d9a92c7ec84367953504fbff17172b2607ca26ce953a83c5fcf851c`, `main.py` `cebdf0fb9dbbc65eb0f19ad04a93f18d66013b3f8e0fdfbef159f33198a93bf3`, `dist/index.js` `fcc0b4afd4a00c35d6e81eb25e4bc62f33e9f74dfb34afb0d79abac220cea684`, `dist/index.js.map` `d6996f91428769acdc6622ba83adf0a06477341521b842b48f5c359b56b625cc`.
+- No files were copied and no service was restarted during this check. Hash/identity installation verification passed; independent Gaming Mode loading and UI behavior checks remain pending.
+
+### Phase 7 reaction notifications — manual verification pending
+
+- The reaction notification fix has not been deployed or tested in Gaming Mode. After deployment, verify that another participant reacting to one of the user's sent messages produces one notification, while self-reactions, reactions to another person's message, and reaction removals do not. Check preview and sound settings. Codex did not connect to WhatsApp or inspect conversations.
+
 ### Closeout session attempt — 2026-10-17
 
 - Read-only SSH confirmed `plugin_loader.service` active and distinct production (`Decky WhatsApp` / `decky-whatsapp`) and MOCK (`Decky WhatsApp MOCK` / `decky-whatsapp-mock`) identities. The first no-game process scan was invalid because it matched its own SSH command text; the corrected scan reported no matching Steam game/compatibility path.
@@ -173,7 +218,7 @@ This file holds detailed evidence moved from `PLAN.md`; the plan remains the sou
 ### Phase 5 Linux/Windows/Deck checks — user-confirmed, 2026-10-16
 
 - User reported that Phase 5 manual checks passed and declared the phase complete. Their confirmation covers installation, bridge/tunnel behavior, messaging, chronological ordering, reconnects/restart, and controller focus/scroll follow-ups.
-- The custom-port check was intentionally ignored by the user. The Linux release asset remains pending a matching future authorized release.
+- The custom-port check was intentionally ignored by the user. The Linux companion asset was later published in GitHub release v1.1.0; see the release record below.
 - Historical Linux manual test was initially partial: install completed after manual Deck address entry; SSH was reachable and QR authentication succeeded, but the plugin remained “Computer unavailable, retrying connection,” and the launcher re-prompted for the Deck address. Address persistence/startup-status fixes were later reviewed, and the user subsequently confirmed final Phase 5 checks passed.
 - Ubuntu VM installer host prompt used `127.0.0.2` and declined an unknown host key. User said install/key flow appeared successful and confirmed generating an unencrypted test key. Exact `ssh-copy-id` output was not captured; that specific setup result is user-reported, not independently verified. No Deck login or tunnel was attempted in that VM test.
 
@@ -310,7 +355,37 @@ Use this checklist to track checks that require the user's physical Deck, VM int
 - [x] Verify the checkout-with-spaces path on Linux in the Ubuntu VM. The Windows full-suite/typecheck/build run also passed from a temporary spaced checkout on 2026-10-17.
 - [ ] Optional Whisper installer: run on the Deck, verify read-only recovery/package/model validation and a successful transcription, plus a controlled failure with sanitized logs.
 
+### Phase 7 ordinary video — physical MOCK checks
+
+- [x] Install the reviewed MOCK-only video artifact and verify installed hashes, MOCK identity, and active `plugin_loader.service`.
+- [x] Open the fabricated video in Gaming Mode, confirm it starts paused, then confirm it plays to completion without a media error.
+- [x] Verify the production plugin runtime tree hash remains `12517be3ff25c86587a6ed960e43cdb9f0360a2e09a9818154246d5557af15ef`; all five installed MOCK hashes match the reviewed artifact.
+- [ ] Confirm pause/resume controls and physical controller navigation remain usable.
+- [ ] Confirm the video playback-error fallback and fabricated view-once fallback (no player or retry) in Gaming Mode.
+
 ### Intentionally excluded
 
 - [ ] Custom bridge-port check (user chose to ignore it).
 - [ ] Any real WhatsApp login/pairing, conversation read, message/reaction/edit/delete, or other account-side mutation; these remain prohibited by the project safety rules.
+
+### GitHub release publication — 2026-10-18
+
+- Published [Decky WhatsApp 1.1.0](https://github.com/db452/DeckyWhatsapp/releases/tag/v1.1.0), tag v1.1.0, targeting commit d9a39b2. GitHub reports it as the latest release.
+- Built the production Decky frontend with `npm.cmd --prefix decky-plugin run build` (passed) and packaged the installable runtime allowlist using the same `decky-whatsapp/` archive layout as the previous plugin ZIP: `plugin.json`, `package.json`, `main.py`, `dist/index.js`, and `dist/index.js.map`. ZIP integrity and production manifest/package identity checks passed. The ZIP was not installed from Decky Loader as part of this publishing task.
+- The release contains these local files:
+  - `decky-whatsapp-decky-plugin-v1.1.0.zip` — SHA-256 `4C2562E8290074D07401D003B43D53E4989132F3379EACE49B6063D17FC995F1`.
+  - `decky-whatsapp-pc-windows-v1.1.0.zip` — SHA-256 `9863B46A41186D9C28C18893689451ED499ADDB15B72DB7D21A6D151F00A0E83`.
+  - `decky-whatsapp-pc-linux-v1.1.0.zip` — SHA-256 `0794A267469CB32637FABDC6FC992B1D18230F473901848E49955D886AE873A1`.
+  - `SHA256SUMS-v1.1.0.txt` — SHA-256 `5A8AA4198BAC6839BF7EE2C3880D5982572E7974AFA11D7E3CD5D6B8BBE07F32`.
+- Renamed the Windows and Linux archive files to v1.1.0 as requested; their verified package contents were preserved.
+- The v1.1.0 release asset names and GitHub tag are updated; existing internal package/manifest version fields remain 1.0.0 from the source commit.
+- Downloaded every release asset and compared its SHA-256 with the corresponding local file; all four matched. The v1.1.0 release now lists only the corrected versioned filenames and is the latest release.
+
+### Phase 7 production test staging — 2026-10-18
+
+- Built the production Deck frontend with `npm.cmd --prefix decky-plugin run build` (passed). Verified production identity `Decky WhatsApp` / `decky-whatsapp`, package `decky-whatsapp-plugin`, and ESM format.
+- Read-only Deck preflight confirmed the existing production directory and `dist` are real directories, the production identity matches, and `plugin_loader.service` is active. Before staging, the five installed runtime hashes were recorded.
+- Staged the five runtime files and SHA-256 manifest at `/home/deck/decky-whatsapp-production-video-20261018-112613/decky-whatsapp`. All five remote checksums and manifest identity passed. A production-only guarded installer was staged at `/home/deck/decky-whatsapp-production-video-20261018-112613/install-production.sh`; its remote SHA-256 is `07454d387c9d4da7c5e501cc69888be933c3c7b13a84733c743be059561b10fc` and `bash -n` passed.
+- After staging, all five installed production hashes still matched the preflight values and `plugin_loader.service` remained active. No installed production file was changed, no Decky restart was run, and no PC bridge was started or stopped.
+- The matching Windows companion package was prepared at `artifacts/decky-whatsapp-video-windows-companion-20261018/decky-whatsapp-pc-windows-v1.0.0.zip`. The allowlisted ZIP passed integrity and contents checks (19 files; includes updated `src/whatsapp.ts`; excludes `.env` and WhatsApp auth data). SHA-256: `7fd9146dd81a7482eeb3c487e6e92a668ef7130678a9390f7cf5d577265df665`. The archive name reflects the current root `package.json` version; it is a local test package, not a published release.
+- **Pending:** the user must run the guarded installer after closing any game, then update/restart the PC companion from the matching Windows package before end-to-end production testing. Production video playback and the remaining physical MOCK checks have not been verified by this staging task.

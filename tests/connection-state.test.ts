@@ -1,7 +1,7 @@
 // Unit tests for user-facing connection labels; no Deck or bridge is contacted.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createPluginConnectionSession, getConnectionHeadline, getConnectionToggleLabel, getConnectionWarning, runResumeRecovery } from "../decky-plugin/src/connection-state.ts";
+import { createPluginConnectionSession, getConnectionHeadline, getConnectionToggleLabel, getConnectionWarning, runResumeRecovery } from "../decky-plugin/src/connection/connection-state.ts";
 
 test("connection control is a simple local start or stop toggle", () => {
   assert.equal(getConnectionToggleLabel(false), "Start");

@@ -17,6 +17,7 @@ while [[ -L "${source_path}" ]]; do
 done
 PROJECT_ROOT="$(cd -P -- "$(dirname -- "${source_path}")" && pwd)"
 source "${PROJECT_ROOT}/scripts/launcher-validation.sh"
+source "${PROJECT_ROOT}/scripts/linux-deck-host-config.sh"
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
@@ -29,55 +30,8 @@ suggest_deck_host() {
   node "${PROJECT_ROOT}/scripts/suggest-deck-host.mjs" 2>/dev/null || true
 }
 
-read_saved_deck_host() {
-  local config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  local config_dir="${config_home}/decky-whatsapp"
-  local host_file="${config_dir}/deck-host"
-  local owner
-  local permissions
-  SAVED_DECK_HOST=""
-  [[ "${config_home}" == /* ]] || return 1
-  [[ -e "${config_dir}" || -L "${config_dir}" ]] || return 0
-  [[ -d "${config_dir}" && ! -L "${config_dir}" ]] || return 1
-  owner="$(stat -c '%u' -- "${config_dir}")" || return 1
-  [[ "${owner}" == "${EUID}" ]] || return 1
-  permissions="$(stat -c '%a' -- "${config_dir}")" || return 1
-  [[ "${permissions}" =~ ^[0-7]+$ ]] || return 1
-  (( (8#${permissions} & 077) == 0 )) || return 1
-  [[ -e "${host_file}" || -L "${host_file}" ]] || return 0
-  [[ -f "${host_file}" && ! -L "${host_file}" ]] || return 1
-  owner="$(stat -c '%u' -- "${host_file}")" || return 1
-  permissions="$(stat -c '%a' -- "${host_file}")" || return 1
-  [[ "${owner}" == "${EUID}" && "${permissions}" =~ ^[0-7]+$ ]] || return 1
-  (( (8#${permissions} & 077) == 0 )) || return 1
-  IFS= read -r SAVED_DECK_HOST < "${host_file}" || [[ -n "${SAVED_DECK_HOST}" ]] || return 1
-  valid_deck_host "${SAVED_DECK_HOST}" || { SAVED_DECK_HOST=""; return 1; }
-}
-
 load_saved_deck_host() {
   read_saved_deck_host || fail "Saved Deck address is invalid or has unsafe ownership/permissions. Reconfigure it with --configure-deck-host."
-}
-
-save_deck_host() {
-  local config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  local config_dir="${config_home}/decky-whatsapp"
-  local host_file="${config_dir}/deck-host"
-  local temporary_file
-  [[ "${config_home}" == /* ]] || fail "XDG_CONFIG_HOME must be an absolute path."
-  if [[ -e "${config_dir}" || -L "${config_dir}" ]]; then
-    [[ -d "${config_dir}" && ! -L "${config_dir}" ]] || fail "DeckyWhatsapp config path is not a real directory: ${config_dir}"
-    [[ "$(stat -c '%u' -- "${config_dir}")" == "${EUID}" ]] || fail "DeckyWhatsapp config directory is not owned by this user: ${config_dir}"
-  else
-    mkdir -p -- "${config_dir}" || fail "Could not create user config directory: ${config_dir}"
-  fi
-  chmod 700 -- "${config_dir}" || fail "Could not restrict permissions on ${config_dir}"
-  [[ ! -d "${host_file}" ]] || fail "Deck address config path is a directory: ${host_file}"
-  temporary_file="$(mktemp "${config_dir}/.deck-host.XXXXXX")" || fail "Could not create a temporary Deck address config."
-  chmod 600 -- "${temporary_file}" || { rm -f -- "${temporary_file}"; fail "Could not restrict permissions on temporary Deck config."; }
-  if ! printf '%s\n' "${deck_host}" > "${temporary_file}" || ! mv -f -- "${temporary_file}" "${host_file}"; then
-    rm -f -- "${temporary_file}"
-    fail "Could not save the Deck address to ${host_file}."
-  fi
 }
 
 requested_host=""
@@ -132,7 +86,7 @@ if (( configure_host )); then
     fi
   fi
   valid_deck_host "${deck_host}" || fail "Invalid Steam Deck hostname/address. Use a hostname or IP without spaces or SSH options."
-  save_deck_host
+  save_deck_host_config "${deck_host}"
   printf 'Saved the default Steam Deck address for this user. No bridge or SSH tunnel was started.\n'
   exit 0
 fi
@@ -163,7 +117,7 @@ if [[ -z "${deck_host}" ]]; then
     read -r -p "Enter the Steam Deck hostname or IP address manually: " deck_host
   fi
   valid_deck_host "${deck_host}" || fail "Invalid Steam Deck hostname/address. Use a hostname or IP without spaces or SSH options."
-  save_deck_host
+  save_deck_host_config "${deck_host}"
   printf 'Saved the default Steam Deck address for this user.\n'
 fi
 valid_deck_host "${deck_host}" || fail "Invalid Steam Deck hostname/address. Use a hostname or IP without spaces or SSH options."

@@ -9,7 +9,7 @@ type SocketOptions = {
 };
 
 // Keep the historical helper import path for existing tests and callers.
-export { createQueuedRequest, createRevisionGuard } from "./sync-helpers";
+export { createQueuedRequest, createRevisionGuard } from "../messages/sync-helpers";
 
 // Both the panel and notifications must survive a bridge restart, and must
 // not open a late socket after their owner has stopped/unmounted.
@@ -18,6 +18,9 @@ export function connectSocket(options: SocketOptions) {
   let socket: WebSocket | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let openTimer: ReturnType<typeof setTimeout> | undefined;
+  const suspendGapThresholdMs = 60_000;
+  const suspendCheckIntervalMs = 30_000;
+  let lastSuspendCheck = Date.now();
 
   const retry = () => {
     if (stopped || retryTimer !== undefined) return;
@@ -27,21 +30,35 @@ export function connectSocket(options: SocketOptions) {
     }, options.retryDelay ?? 2000);
   };
 
+  const lost = (current: WebSocket) => {
+    if (stopped || socket !== current) return;
+    clearTimeout(openTimer);
+    socket = undefined;
+    current.close();
+    options.onClose?.();
+    retry();
+  };
+
+  const suspendCheckTimer = setInterval(() => {
+    const now = Date.now();
+    const elapsed = now - lastSuspendCheck;
+    lastSuspendCheck = now;
+    const current = socket;
+    if (elapsed >= suspendGapThresholdMs && current) {
+      // Steam's resume callback is primary, but a long browser timer gap also
+      // detects suspend when Decky misses that callback. Run the guarded loss
+      // path directly because close events can be delayed or suppressed.
+      lost(current);
+    }
+  }, suspendCheckIntervalMs);
+
   const connect = async () => {
     try {
       const url = await options.url();
       if (stopped) return;
       const current = new WebSocket(url);
       socket = current;
-      const lost = () => {
-        if (stopped || socket !== current) return;
-        clearTimeout(openTimer);
-        socket = undefined;
-        current.close();
-        options.onClose?.();
-        retry();
-      };
-      openTimer = setTimeout(lost, 15_000);
+      openTimer = setTimeout(() => lost(current), 15_000);
       current.onopen = () => {
         if (stopped || socket !== current) return;
         clearTimeout(openTimer);
@@ -55,9 +72,9 @@ export function connectSocket(options: SocketOptions) {
       current.onerror = (error) => {
         if (stopped || socket !== current) return;
         options.onError?.(error);
-        lost();
+        lost(current);
       };
-      current.onclose = lost;
+      current.onclose = () => lost(current);
     } catch (error) {
       if (stopped) return;
       options.onError?.(error);
@@ -72,6 +89,7 @@ export function connectSocket(options: SocketOptions) {
       stopped = true;
       clearTimeout(retryTimer);
       clearTimeout(openTimer);
+      clearInterval(suspendCheckTimer);
       socket?.close();
       socket = undefined;
     }

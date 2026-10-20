@@ -13,7 +13,7 @@ export type IncomingMessage = {
   sendFailureNotice?: string;
   mediaLoadState?: "loading" | "unavailable";
   quotedMessageId?: string;
-  mediaKind?: "image" | "sticker" | "gif" | "audio";
+  mediaKind?: "image" | "sticker" | "gif" | "audio" | "video";
   reaction?: string;
   reactions?: string[];
   image?: {
@@ -23,7 +23,7 @@ export type IncomingMessage = {
   media?: {
     dataUrl: string;
     filename?: string;
-    kind: "image" | "sticker" | "gif" | "audio";
+    kind: "image" | "sticker" | "gif" | "audio" | "video";
     mimetype: string;
   };
 };

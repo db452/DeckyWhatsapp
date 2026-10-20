@@ -1,17 +1,17 @@
 # PLAN.md — DeckyWhatsapp UX Improvement Roadmap
 
-**Overall status:** APPROVED. Phases 1–6 are complete per user decisions and manual verification. The Phase 5 Linux release asset remains pending an authorized matching release. The user removed the GitHub-hosted package workflow; Linux verification remains available through the dedicated VM.
-**Current task:** Created and verified dated Windows and Linux v1.0.0 companion ZIPs in `releases/2026-10-18/`. Phase 6 manual checks, the final code review, sensitive-file ignore audit, and stale artifact cleanup are complete. GitHub publication remains pending explicit authorization.
-**Implementation status:** Phase 6.1 core work, Tasks 6.2–6.4 code-level work, Task 6.3 security review, approved MOCK work, and the reusable CDP harness are reviewed. The full suite passed 112/112; MOCK suite passed 12/12; both typechecks and the production build passed. Windows and Linux tests/builds from checkout paths containing spaces passed; Linux launcher checks and companion ZIP inspections passed. After three review passes and failed physical retesting, image expansion was removed from both builds; inline previews and audio Y remain. The combined update passed review pass 2 and is installed. Read-only Deck verification confirmed both plugin identities, all seven expected frontend/MOCK hashes, active `plugin_loader.service`, and production tree hash `12517be3ff25c86587a6ed960e43cdb9f0360a2e09a9818154246d5557af15ef`. The user reported all remaining Phase 6 manual checks passed; details are in [RESULTS.md](RESULTS.md#user-manual-test-checklist). Optional Whisper verification and publication of the Phase 5 Linux asset remain outside this closeout.
+**Overall status:** APPROVED. Phases 1–6 are complete per user decisions and manual verification. The Windows and Linux companion packages are published in GitHub release v1.1.0. The user removed the GitHub-hosted package workflow; Linux verification remains available through the dedicated VM.
+**Current task:** Phase 7 — ordinary incoming video playback. Source implementation, automated verification, and independent review are complete. The guarded MOCK-only update is installed; physical playback and no-autoplay checks passed. Remaining MOCK checks are pause/resume, controller navigation, playback-error fallback, and view-once fallback. A production-only Deck update and matching Windows companion package are staged; the Deck install/restart and production verification are pending user action. Phase 6 and release v1.1.0 closeout remain complete.
+**Implementation status:** Phase 7 is pending the remaining physical MOCK checks and user-run production verification. Ordinary videos now have bridge classification, bounded MP4/WebM download support, and a controlled inline player; view-once media remains intentionally unsupported. The production plugin files currently installed on the Deck remain unchanged. Phase 6.1 core work, Tasks 6.2–6.4, security review, approved MOCK work, and the reusable CDP harness are reviewed. Phase 6 and production staging evidence are in [RESULTS.md](RESULTS.md).
 
 ## Release closeout — existing scope only
 
-**Status: NOT READY TO PUBLISH.** Phase 6 manual checks are complete per user confirmation. The remaining external step is attaching the matching Linux companion ZIP to an authorized GitHub release. Use [RESULTS.md](RESULTS.md#user-manual-test-checklist) for evidence and any remaining optional checks.
+**Status: COMPLETE — GitHub release v1.1.0 published and verified on 2026-10-18.** Phase 6 manual checks are complete per user confirmation. Release details and asset hash verification are recorded in [RESULTS.md](RESULTS.md#github-release-publication).
 
 1. **Complete — Deck regression checks.** Phase 6.1 startup/controller/lifecycle, Start/Stop/reconnect, and existing UI behavior passed per user report. Keep private production messages and credentials out of diagnostics.
 2. **Complete — isolated MOCK checks.** Production isolation, physical controller navigation, image-Y no-op behavior with inline previews, view-once fallbacks, and reset/remount behavior passed per user report. The separate-screen image viewer was removed after three review passes did not resolve its Deck behavior.
 3. **Complete — manual cross-platform checks.** The suggested-host flow across docked Ethernet/Wi-Fi passed per user report. Windows and Linux suite/build checks from paths containing spaces, Linux launcher regression checks, and Ubuntu installer/runtime validation passed; details are in [RESULTS.md](RESULTS.md).
-4. **Local artifacts ready; publication pending.** Local Windows and Linux ZIP builds and inspections passed. Attach the matching archives to a GitHub release only after the user authorizes that external change.
+4. **Complete — publish installable packages.** GitHub release [v1.1.0](https://github.com/db452/DeckyWhatsapp/releases/tag/v1.1.0) contains the production Decky plugin ZIP, Windows and Linux PC companion ZIPs, and a SHA256 manifest. Uploaded files were downloaded and verified against the local release folder.
 
 For any required code fix, use at most three independent review passes total. If a non-critical feature still fails after that, leave it out of the release rather than expanding scope. Phase 1–5 user-confirmed checks do not need to be repeated. The optional Whisper runtime check and previously deferred Phase 1 Deck SSH/stale-tunnel checks are not release-closeout work.
 
@@ -61,7 +61,7 @@ Preserve the current architecture consisting of a computer-hosted WhatsApp bridg
 - [x] Display understandable connection states: Connected, Connecting, Reconnecting, Computer unavailable, Authentication required.
 - [x] Avoid repeated error notifications during temporary interruptions.
 
-**Relevant files:** `decky-plugin/src/index.tsx`, `decky-plugin/src/connection.ts`
+**Relevant files:** `decky-plugin/src/index.tsx`, `decky-plugin/src/connection/connection.ts`
 
 **Acceptance criteria:**
 
@@ -350,7 +350,7 @@ Complete these on Windows in addition to the relevant Section 8 checks.
 
 **Priority: P1/P2 — New platform support**
 
-**Status: COMPLETE per user confirmation on 2026-10-16.** The user confirmed the Linux and Windows behavior and all Phase 5 manual checks work as expected. The future GitHub Release asset under Task 5.4 remains unchecked because it requires a matching authorized release.
+**Status: COMPLETE per user confirmation on 2026-10-16.** The user confirmed the Linux and Windows behavior and all Phase 5 manual checks work as expected. The Linux and Windows companion assets were subsequently published in GitHub release v1.1.0; Task 5.4 is complete.
 
 ### Objective
 
@@ -447,7 +447,7 @@ The Steam Deck will continue running the same Decky plugin. The main difference 
 
 **Implementation:**
 
-- [ ] Create and verify a Linux companion package asset in GitHub Releases. — Pending a matching authorized release; see RESULTS.md.
+- [x] Create and verify the Linux companion package asset in GitHub Releases. — Published in v1.1.0; downloaded asset hash matches the local package. See RESULTS.md.
 - [x] Create distinct Windows and Linux companion ZIPs under local `releases/` with the files required for each platform.
 - [x] Include the Linux installer and launcher.
 - [x] Keep Windows and Linux releases distinguishable.
@@ -1014,3 +1014,33 @@ DeckyWhatsapp should be considered meaningfully improved when:
 - [x] Confirm MOCK loads without changing production settings, runtime data, logs, or RPC identity. User reports isolation checks passed; Codex did not inspect private production settings or logs.
 - [x] In Gaming Mode, use controller navigation to exercise fabricated conversations/actions, older history, inline previews, image Y no-op behavior, audio Y playback, and notifications. User reports these physical checks passed; see [RESULTS.md](RESULTS.md#manual-tests).
 - [x] Reset and remount MOCK; verify fixture reset, settings, subscriptions, and production isolation. User reports these Deck checks passed; see [RESULTS.md](RESULTS.md#manual-tests).
+
+## Phase 7 — Ordinary video playback
+
+**Status: REACTION NOTIFICATION FIX IMPLEMENTED AND VALIDATED; PHYSICAL DECK CHECKS PENDING.** Approved by the user on 2026-10-18. Add playback for ordinary incoming WhatsApp videos while retaining the existing unsupported view-once fallback. Follow-ups add Y-button video playback, suppress stale notification events after enable/reconnect, and notify for incoming reactions to the user's own messages. This is a post-release update and does not alter the published v1.1.0 assets. Use `deploy-decky-plugins.bat` to rebuild and stage both variants, then deploy only after its explicit confirmation prompt.
+
+### Implementation and automated verification
+
+- [x] Recognize ordinary `video` messages separately from GIFs and view-once media; provide a useful video fallback label instead of `[System message]`.
+- [x] Extend bridge/frontend media types and the Deck UI with an inline video player using explicit user controls; do not autoplay ordinary videos.
+- [x] Preserve the existing media size limit, cache bounds, and unsupported view-once behavior; reject unsupported video MIME types cleanly.
+- [x] Add fabricated offline MOCK video data and assertions for render/playback controls, view-once isolation, and zero production bridge/WhatsApp access.
+- [x] Add bridge regression coverage for video classification, download acceptance/rejection, and fallback labels.
+- [x] Run relevant tests, MOCK tests, both typechecks, production and MOCK builds; pass independent code review (three passes used). Evidence is in [RESULTS.md](RESULTS.md#phase-7-ordinary-video).
+- [x] Make Y play/pause ordinary video while retaining voice playback, image no-op, view-once exclusion, and text-entry suppression; validate with fabricated MOCK controller input. Independent review passed on pass 1.
+- [x] Suppress notifications unless the Deck connection and notification socket are active, and reject messages timestamped before the current socket session. Keep background notifications available while the panel is closed. Unit tests and independent review passed on pass 1; see [RESULTS.md](RESULTS.md#phase-7-follow-up-video-controller-and-notification-session).
+- [x] Run the full root suite after adding notification-session coverage: `npm.cmd test` passed **120/120** using the repository test preload. Reviewer independently passed notification/session, notification-ID-cache, and connection tests **14/14**, plus MOCK tests **12/12** and plugin typecheck.
+- [x] Notify for a new reaction from another participant on a message authored by the user, while retaining notification preferences, deduplication, active-session timestamp gating, and privacy behavior. Missing attribution, timestamp, reaction ID, or emoji fails closed. Focused automated checks passed; this small hotfix used the explicitly requested Fixer workflow, which does not include a review pass. See [RESULTS.md](RESULTS.md#phase-7-reaction-notification-fix).
+
+### Manual MOCK verification
+
+- [x] Install the staged guarded MOCK-only update and verify the fabricated ordinary video displays and plays in Gaming Mode. The user installed the MOCK artifact; installed hashes and the unchanged production tree were checked. Physical playback reached the clip's end; see [RESULTS.md](RESULTS.md#phase-7-ordinary-video).
+- [x] Confirm ordinary video does not autoplay. The player began paused with native controls visible; its `autoplay` property is false.
+- [ ] Verify pause/resume with the player controls, controller navigation, and the playback-error fallback in Gaming Mode.
+- [ ] Confirm fabricated view-once video still shows the phone fallback and has no player or retry action.
+- [x] Verify the installed production and MOCK runtime trees match the latest local combined deployment artifact; confirm expected identities and active `plugin_loader.service` by read-only SSH. See [RESULTS.md](RESULTS.md#phase-7-combined-production-and-mock-version-check).
+- [ ] Confirm both variants load independently in Gaming Mode and production remains isolated from MOCK state.
+- [ ] On the MOCK build, use Y to start, pause, and resume the fabricated ordinary video; confirm voice Y behavior and image/view-once exclusions.
+- [ ] With production connected, verify messages that arrived while DeckyWhatsapp was disabled/offline do not produce delayed toasts after start/reconnect; verify a fresh incoming message while active can notify, including with the panel closed. The user performs this check; Codex must not connect to or interact with the live WhatsApp account.
+- [ ] With production connected, receive a reaction from another participant on one of the user's messages and confirm one notification appears. Confirm self-reactions, reactions to another person's message, and reaction removals do not notify; check preview and sound preferences.
+- [x] Verify the installed production plugin runtime tree remains unchanged. Do not inspect production data or credentials.

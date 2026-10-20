@@ -1,7 +1,7 @@
 // Unit tests for contact timestamp formatting in the local timezone.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatChatTimestamp } from "../decky-plugin/src/format.ts";
+import { formatChatTimestamp } from "../decky-plugin/src/messages/format.ts";
 
 test("contact timestamps use local time for today and Yesterday for the prior day", () => {
   const now = new Date(2026, 9, 15, 17, 0);

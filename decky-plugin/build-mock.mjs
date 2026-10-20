@@ -1,5 +1,5 @@
 import { copyFile, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import deckyPlugin from "@decky/rollup";
 import { rollup } from "rollup";
@@ -35,8 +35,9 @@ config.plugins = config.plugins.filter((plugin) => plugin.name !== "delete" && p
 config.plugins.unshift({
   name: "select-offline-mock-provider",
   resolveId(source, importer) {
-    if (source === "./provider-selected" && importer && /[\\/]src[\\/]index\.tsx$/.test(importer)) {
-      return resolve("src/mock-provider-entry.ts");
+    if (importer && /[\\/]src[\\]/.test(importer)
+      && resolve(dirname(importer), source) === resolve("src/providers/provider-selected")) {
+      return resolve("src/providers/mock-provider-entry.ts");
     }
     return null;
   }

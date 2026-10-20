@@ -9,10 +9,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\deploy-dec
 set "DEPLOY_EXIT=%ERRORLEVEL%"
 if not "%DEPLOY_EXIT%"=="0" (
     echo.
-    echo Deployment did not complete successfully. Review the messages above.
+    if "%DEPLOY_EXIT%"=="2" (
+        echo Deployment was cancelled. The Deck plugins were not installed.
+    ) else (
+        echo Deployment did not complete successfully. Review the messages above.
+    )
+    echo.
+    pause
     exit /b %DEPLOY_EXIT%
 )
 echo.
-echo Success!
-timeout /t 3 /nobreak >nul
+echo Both Decky plugin variants were installed and plugin_loader.service is active.
+echo.
+pause
 exit /b 0

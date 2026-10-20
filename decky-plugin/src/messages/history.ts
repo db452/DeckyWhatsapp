@@ -1,4 +1,4 @@
-import type { IncomingMessage } from "./types/message";
+import type { IncomingMessage } from "../types/message";
 
 export const INITIAL_COMPACT_HISTORY_LIMIT = 5;
 export const HISTORY_EXPANSION_SIZE = 10;

@@ -58,26 +58,12 @@ function Write-TargetSummary {
 
 function Test-LocalPortOccupied {
     try {
-        $connections = @(Get-NetTCPConnection -State Listen -LocalPort $LocalPort -ErrorAction Stop)
-        return ($connections.Count -gt 0)
+        $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop)
+        $matchingListeners = @($listeners | Where-Object { [int]$_.LocalPort -eq $LocalPort })
+        return ($matchingListeners.Count -gt 0)
     }
     catch {
-        # Get-NetTCPConnection may be unavailable or denied; use a short TCP probe.
-        $client = New-Object System.Net.Sockets.TcpClient
-        try {
-            $pending = $client.BeginConnect($LocalAddress, $LocalPort, $null, $null)
-            if (-not $pending.AsyncWaitHandle.WaitOne(300)) {
-                return $false
-            }
-            $client.EndConnect($pending)
-            return $true
-        }
-        catch {
-            return $false
-        }
-        finally {
-            $client.Close()
-        }
+        throw "Unable to verify whether local port $LocalPort is occupied. Refusing to start or remove tunnel state; no process or metadata was changed."
     }
 }
 
@@ -179,6 +165,47 @@ function Get-RecordStartUtcTicks {
     return $null
 }
 
+function Assert-ValidStateRecord {
+    param([object]$Record)
+
+    $recordPid = 0
+    $recordLocalPort = 0
+    $recordRemotePort = 0
+    $requiredStrings = @("CommandLine", "ExecutablePath", "DeckHost", "DeckUser")
+    if ($Record -isnot [System.Management.Automation.PSCustomObject] -or
+        $null -eq $Record.Pid -or
+        -not [int]::TryParse([string]$Record.Pid, [ref]$recordPid) -or
+        $recordPid -le 0 -or
+        $null -eq (Get-RecordStartUtcTicks -Record $Record) -or
+        (Get-RecordStartUtcTicks -Record $Record) -le 0 -or
+        [string]$Record.LocalAddress -ne $LocalAddress -or
+        -not [int]::TryParse([string]$Record.LocalPort, [ref]$recordLocalPort) -or
+        $recordLocalPort -ne $LocalPort -or
+        [string]$Record.RemoteAddress -ne $RemoteAddress -or
+        -not [int]::TryParse([string]$Record.RemotePort, [ref]$recordRemotePort) -or
+        $recordRemotePort -ne $RemotePort) {
+        throw "Tunnel state metadata is malformed at '$StatePath'. Inspect it manually; no process or metadata was changed."
+    }
+    foreach ($propertyName in $requiredStrings) {
+        $property = $Record.PSObject.Properties[$propertyName]
+        if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            throw "Tunnel state metadata is malformed at '$StatePath'. Inspect it manually; no process or metadata was changed."
+        }
+    }
+
+    $expectedForward = "${LocalAddress}:${LocalPort}:${RemoteAddress}:${RemotePort}"
+    $expectedDestination = "$($Record.DeckUser)@$($Record.DeckHost)"
+    $savedCommand = [string]$Record.CommandLine
+    if ([System.IO.Path]::GetFileName([string]$Record.ExecutablePath) -ine "ssh.exe" -or
+        $savedCommand.IndexOf($expectedForward, [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $savedCommand.IndexOf($expectedDestination, [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $savedCommand.IndexOf("-N", [StringComparison]::Ordinal) -lt 0 -or
+        $savedCommand.IndexOf("BatchMode=yes", [StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+        $savedCommand.IndexOf("ExitOnForwardFailure=yes", [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        throw "Tunnel state metadata is malformed at '$StatePath'. Inspect it manually; no process or metadata was changed."
+    }
+}
+
 function Test-RecordedProcessInstance {
     param(
         [object]$ProcessInfo,
@@ -238,10 +265,28 @@ function Invoke-Start {
 
     $priorRecord = Get-StateRecord
     if ($null -ne $priorRecord) {
-        if ($null -ne (Get-ValidatedOwnedProcess -Record $priorRecord)) {
-            throw "A tunnel process is already recorded and running (PID $($priorRecord.Pid)), but its CDP endpoint is not ready. Use Status to inspect it; refusing to launch a second tunnel."
+        Assert-ValidStateRecord -Record $priorRecord
+        $recordPid = [int]$priorRecord.Pid
+        try {
+            $recordedProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $recordPid" -ErrorAction Stop
         }
-        throw "Tunnel state metadata already exists but its process identity cannot be verified. Inspect '$StatePath' manually; refusing to overwrite it or launch another tunnel."
+        catch {
+            throw "Unable to determine whether recorded PID $recordPid exists. Inspect '$StatePath' manually; no process or metadata was changed."
+        }
+
+        if ($null -ne $recordedProcess) {
+            if ($null -ne (Get-ValidatedOwnedProcess -Record $priorRecord)) {
+                throw "A tunnel process is already recorded and running (PID $($priorRecord.Pid)), but its CDP endpoint is not ready. Use Status to inspect it; refusing to launch a second tunnel."
+            }
+            throw "Recorded PID $recordPid exists, but its process identity cannot be validated. Inspect '$StatePath' manually; no process or metadata was changed."
+        }
+
+        # Remove only an intact record whose PID lookup succeeded and found no
+        # process, after rechecking that the configured forwarding port is free.
+        if (Test-LocalPortOccupied) {
+            throw "Tunnel PID $recordPid is absent, but local port $LocalPort is occupied. Inspect '$StatePath' manually; no process or metadata was changed."
+        }
+        Remove-StateFile
     }
 
     $sshCommand = Get-Command ssh.exe -ErrorAction Stop

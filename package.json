@@ -7,9 +7,9 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "test": "node --import tsx --test --test-concurrency=1 scripts/suggest-deck-host.test.mjs scripts/mock-deck-cdp.test.mjs src/whatsapp.test.ts tests/connection.test.ts tests/connection-state.test.ts tests/format.test.ts tests/message-status.test.ts tests/notification-id-cache.test.ts decky-plugin/src/history.test.ts decky-plugin/src/view-once.test.ts decky-plugin/src/message-actions.test.ts decky-plugin/src/steam-compat.test.ts tests/windows-installer-host.test.ts tests/server.test.ts tests/tunnel.test.ts",
+    "test": "node --import tsx --test --test-concurrency=1 scripts/suggest-deck-host.test.mjs scripts/mock-deck-cdp.test.mjs src/whatsapp.test.ts tests/connection.test.ts tests/connection-state.test.ts tests/format.test.ts tests/message-status.test.ts tests/notification-id-cache.test.ts decky-plugin/src/notifications/notification-session.test.ts decky-plugin/src/messages/history.test.ts decky-plugin/src/messages/view-once.test.ts decky-plugin/src/messages/message-actions.test.ts decky-plugin/src/platform/steam-compat.test.ts tests/windows-installer-host.test.ts tests/server.test.ts tests/tunnel.test.ts",
     "build:mock": "npm --prefix decky-plugin run build:mock",
-    "test:mock": "npm run build:mock && node --experimental-test-module-mocks --import ./scripts/mock-test-node-preload.mjs --import tsx --test --test-concurrency=1 decky-plugin/src/mock-provider.test.ts decky-plugin/src/production-provider.test.ts",
+    "test:mock": "npm run build:mock && node --experimental-test-module-mocks --import ./scripts/mock-test-node-preload.mjs --import tsx --test --test-concurrency=1 decky-plugin/src/providers/mock-provider.test.ts decky-plugin/src/providers/production-provider.test.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:plugin": "npm --prefix decky-plugin run typecheck",
     "postinstall": "patch-package"
