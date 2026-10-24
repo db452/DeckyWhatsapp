@@ -172,7 +172,9 @@ export const provider: DataProvider = {
       actorId: "mock-actor-nia",
       actorIsMe: false,
       parentFromMe: true,
-      timestamp: Math.floor(Date.now() / 1000)
+      // Notification sessions round their opening watermark up to the next
+      // whole second, so mock events must round up too to remain current.
+      timestamp: Math.ceil(Date.now() / 1000)
     });
   },
   switchSession() {

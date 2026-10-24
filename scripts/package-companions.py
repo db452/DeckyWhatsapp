@@ -42,6 +42,7 @@ PLATFORMS = {
         "files": COMMON_FILES + (
             "install-decky-whatsapp-windows.ps1",
             "start-decky-whatsapp.bat",
+            "assets/decky-whatsapp.ico",
             "keep-ssh-tunnel.ps1",
             "manage-decky-whatsapp.ps1",
             "install-whisper-deck.sh",
@@ -53,6 +54,7 @@ PLATFORMS = {
         "files": COMMON_FILES + (
             "install-decky-whatsapp-linux.sh",
             "start-decky-whatsapp-linux.sh",
+            "assets/decky-whatsapp.svg",
             "keep-ssh-tunnel.sh",
             "scripts/launcher-validation.sh",
             "scripts/linux-bridge-helper.mjs",

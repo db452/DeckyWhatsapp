@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import test from "node:test";
+import test, { mock } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
@@ -11,9 +11,103 @@ import { act, create } from "react-test-renderer";
 import { provider } from "./mock-provider";
 import { createMockProviderLifecycle } from "./mock-provider-lifecycle";
 import { mergeHistorySnapshot, RecentLiveMessageCache } from "../messages/history";
+import { createNotificationSession } from "../notifications/notification-session";
+import { ImageViewerFocusTarget } from "../components/image-viewer-focus-target";
+import { handleConversationCancel, handleImageViewerFocusableCancel } from "../platform/image-viewer-cancel";
+
+test("ImageViewerModal renders its image and focuses the modal target", async () => {
+  const focusCalls: Array<{ preventScroll?: boolean }> = [];
+  const animationFrames: Array<() => void> = [];
+  const ownerWindow = {
+    requestAnimationFrame(callback: () => void) { animationFrames.push(callback); return animationFrames.length; },
+    cancelAnimationFrame() {}
+  };
+  const ownerDocument = { documentElement: {}, defaultView: ownerWindow };
+  const originalReactGlobal = (globalThis as { React?: unknown }).React;
+  (globalThis as { React?: unknown }).React = React;
+  const Focusable = React.forwardRef<HTMLDivElement, { children?: React.ReactNode; [key: string]: unknown }>(
+    (props, ref) => React.createElement("div", { ...props, ref }, props.children)
+  );
+
+  mock.module("react-dom", { exports: { createPortal: (children: React.ReactNode) => children } });
+  mock.module("@decky/ui", { exports: {
+    Focusable,
+    ModalRoot: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    NavEntryPositionPreferences: { FIRST: 0 }
+  } });
+  try {
+    const { ImageViewerModal } = await import("../components/ImageViewerModal?image-viewer-modal-test");
+    const renderer = create(React.createElement(ImageViewerModal, {
+      imageDataUrl: "data:image/png;base64,AA==",
+      imageLabel: "MOCK fixture image",
+      onClose() {}
+    }), {
+      createNodeMock(element) {
+        if (element.type !== "div") return null;
+        return {
+          ownerDocument,
+          isConnected: true,
+          focus(options?: { preventScroll?: boolean }) { focusCalls.push(options || {}); }
+        };
+      }
+    });
+    await act(async () => {});
+    assert.equal(renderer.root.findByType("img").props.src, "data:image/png;base64,AA==");
+    assert.equal(renderer.root.findByType("img").props.alt, "MOCK fixture image");
+    const focusable = renderer.root.findAllByType("div").find((node) => node.props.tabIndex === 0);
+    assert.ok(focusable, "the actual image modal mounts its programmatically focusable Decky target");
+    assert.equal(animationFrames.length, 1, "mount schedules focus on the modal target");
+    await act(async () => { animationFrames[0](); });
+    assert.deepEqual(focusCalls, [{ preventScroll: true }], "the modal focus target receives focus without scrolling");
+    renderer.unmount();
+  } finally {
+    mock.restoreAll();
+    (globalThis as { React?: unknown }).React = originalReactGlobal;
+  }
+});
 
 const repositoryRoot = process.cwd();
 let networkAttempts = 0;
+
+test("the viewer consumes B without a raw controller listener and later B returns to contacts", () => {
+  let imageViewerOpen = true;
+  let closeViewerCalls = 0;
+  let closeConversationCalls = 0;
+  const makeEvent = () => {
+    const result = { prevented: false, stopped: false };
+    return {
+      result,
+      event: {
+        preventDefault() { result.prevented = true; },
+        stopPropagation() { result.stopped = true; }
+      }
+    };
+  };
+  const closeViewer = () => {
+    if (!imageViewerOpen) return;
+    closeViewerCalls += 1;
+    imageViewerOpen = false;
+  };
+  const cancelConversation = (event: ReturnType<typeof makeEvent>["event"]) =>
+    handleConversationCancel(event, imageViewerOpen, closeViewer, () => { closeConversationCalls += 1; });
+
+  const whileOpen = makeEvent();
+  handleImageViewerFocusableCancel(whileOpen.event, closeViewer);
+  assert.deepEqual(whileOpen.result, { prevented: true, stopped: true }, "the viewer Focusable consumes B before Decky navigation can reach the conversation");
+  assert.equal(closeViewerCalls, 1, "the viewer's own focused target closes the image");
+  assert.equal(closeConversationCalls, 0, "closing the viewer preserves the conversation");
+
+  // This is the late ModalRoot callback after a B release: close is idempotent,
+  // and no raw B listener is needed to keep the conversation open.
+  closeViewer();
+  assert.equal(closeViewerCalls, 1, "a delayed modal cancel cannot close twice");
+  assert.equal(closeConversationCalls, 0);
+
+  const nextConversationBack = makeEvent();
+  cancelConversation(nextConversationBack.event);
+  assert.deepEqual(nextConversationBack.result, { prevented: true, stopped: true });
+  assert.equal(closeConversationCalls, 1, "a later B after viewer dismissal closes the conversation normally");
+});
 
 function installIsolatedBrowserStubs(): () => void {
   const oldFetch = globalThis.fetch;
@@ -109,12 +203,18 @@ test("MOCK emits a fabricated incoming reaction to one of the user's messages", 
   const restore = installIsolatedBrowserStubs();
   try {
     provider.reset();
+    const notificationSession = createNotificationSession();
+    const sameSecondAsSessionOpen = 1_700_000_000_100;
+    notificationSession.open(sameSecondAsSessionOpen);
     let received: Extract<import("./provider").BridgeEvent, { type: "reaction" }> | undefined;
     const connection = provider.subscribe((event) => {
       if (event.type === "reaction") received = event;
     }, () => {}, () => {}, () => {});
     await new Promise((resolve) => setImmediate(resolve));
-    provider.simulateReaction();
+    const originalNow = Date.now;
+    Date.now = () => sameSecondAsSessionOpen;
+    try { provider.simulateReaction(); }
+    finally { Date.now = originalNow; }
     connection.close();
 
     assert.equal(received?.chatId, "mock-group-garden");
@@ -125,7 +225,9 @@ test("MOCK emits a fabricated incoming reaction to one of the user's messages", 
     assert.equal(received?.actorId, "mock-actor-nia");
     assert.equal(received?.emoji, "🌱");
     assert.ok(received?.reactionId);
-    assert.ok(Number.isSafeInteger(received?.timestamp));
+    assert.equal(received?.timestamp, Math.ceil(sameSecondAsSessionOpen / 1000));
+    assert.equal(notificationSession.accepts(received?.timestamp, true), true,
+      "a simulated reaction emitted in the session-opening second must pass the current-session guard");
     assert.equal(networkAttempts, 0);
   } finally { restore(); provider.reset(); }
 });
@@ -371,6 +473,9 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
   const apiNames: string[] = [];
   const networkUrls: string[] = [];
   const toastCalls: Array<{ title?: string; body?: string; playSound?: boolean }> = [];
+  const modalCalls: Array<{ modal: React.ReactNode; parent?: EventTarget; options?: { strTitle?: string } }> = [];
+  const imageYOrder: string[] = [];
+  let modalCloseCalls = 0;
   const intervals = new Map<number, ReturnType<typeof setInterval>>();
   const activeTimeouts = new Set<ReturnType<typeof setTimeout>>();
   let nextTimerId = 1;
@@ -411,12 +516,53 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
       removeItem(key: string) { storageKeys.push(key); stored.delete(key); }
     }
   };
-  (globalThis as { document?: unknown }).document = {
-    activeElement: null,
-    body: {},
+  let activeMockElement: { matches(selector: string): boolean; isContentEditable?: boolean } | null = null;
+  let imageDomFocusCalls = 0;
+  let imageBoundsCalls = 0;
+  let conversationMessageQueries = 0;
+  const body = {};
+  const mockScrollViewport = {
+    parentElement: body,
+    scrollTop: 0,
+    scrollHeight: 1000,
+    clientHeight: 400,
+    getBoundingClientRect() { return { top: 0, height: 400 }; }
+  };
+  const mockWindow = {
+    ...timers,
+    innerHeight: 400,
+    getComputedStyle(element: unknown) { return { overflowY: element === mockScrollViewport ? "auto" : "visible" }; }
+  };
+  const mockDocument = {
+    get activeElement() { return activeMockElement; },
+    body,
     scrollingElement: null,
+    defaultView: mockWindow,
     querySelector() { return null; }
   };
+  const messageDomElements = new Map<string, {
+    dataset: { deckyMessageId: string };
+    parentElement: typeof mockScrollViewport;
+    ownerDocument: typeof mockDocument;
+    querySelector(): { focus(): void };
+    getBoundingClientRect(): { top: number; height: number };
+  }>();
+  const messageDomElement = (messageId: string) => {
+    let element = messageDomElements.get(messageId);
+    if (!element) {
+      element = {
+        dataset: { deckyMessageId: messageId },
+        parentElement: mockScrollViewport,
+        ownerDocument: mockDocument,
+        querySelector() { return { focus() { if (messageId === "mock-ava-2") imageDomFocusCalls += 1; } }; },
+        getBoundingClientRect() { if (messageId === "mock-ava-2") imageBoundsCalls += 1; return { top: messageId === "mock-ava-2" ? 800 : 100, height: 100 }; }
+      };
+      messageDomElements.set(messageId, element);
+    }
+    return element;
+  };
+  for (const messageId of ["mock-ava-1", "mock-ava-2", "mock-ava-video", "mock-ava-3"]) messageDomElement(messageId);
+  (globalThis as { document?: unknown }).document = mockDocument;
   (globalThis as { CSS?: unknown }).CSS = { escape(value: string) { return value; } };
   (globalThis as { SP_REACT?: unknown }).SP_REACT = React;
   (globalThis as { SP_JSX?: unknown }).SP_JSX = { Fragment, jsx, jsxs };
@@ -427,6 +573,13 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
     React.createElement("input", { "aria-label": label, value, onChange: (event: { target: { value: string } }) => onChange?.(event.target.value), ...props });
   (globalThis as { DFL?: unknown }).DFL = {
     ButtonItem,
+    NavEntryPositionPreferences: { FIRST: 0, PREFERRED_CHILD: 4 },
+    ModalRoot: passthrough,
+    showModal(modal: React.ReactNode, parent?: EventTarget, options?: { strTitle?: string }) {
+      imageYOrder.push("open");
+      modalCalls.push({ modal, parent, options });
+      return { Close() { modalCloseCalls += 1; }, Update() {} };
+    },
     Focusable: React.forwardRef<HTMLDivElement, { children?: React.ReactNode; [key: string]: unknown }>((props, ref) => React.createElement("div", { ...props, ref }, props.children)),
     PanelSection: passthrough,
     PanelSectionRow: passthrough,
@@ -473,7 +626,12 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
     createNodeMock(element) {
       if (element.type === "video") return videoPlayback;
       if (element.type !== "div") return null;
-      return { ownerDocument: globalThis.document, querySelectorAll() { return []; }, querySelector() { return null; } };
+      const messageId = element.props["data-decky-message-id"];
+      if (typeof messageId === "string") return messageDomElement(messageId);
+      if (typeof element.props.onCancel === "function" && typeof element.props.onFocusCapture === "function") {
+        return { ownerDocument: mockDocument, querySelectorAll() { conversationMessageQueries += 1; return [...messageDomElements.values()]; } };
+      }
+      return { ownerDocument: mockDocument, querySelectorAll() { return []; }, querySelector() { return null; } };
     }
   });
 
@@ -511,9 +669,6 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
     assert.ok(findButton(renderer!, "Deterministic incoming mock"), "active provider subscription should render a fabricated incoming event");
     assert.equal(renderer!.root.findAllByType("button").filter((button) => textOf(button as unknown as { children: unknown[] }).includes("Deterministic incoming mock")).length, 1,
       "repeated resume callbacks must not leak MOCK subscriptions or duplicate events");
-    // The notification session uses second-resolution event times. Wait into a
-    // later second so this simulated event cannot be mistaken for reconnect history.
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1050)); });
     await act(async () => { findButton(renderer!, "Simulate reaction to your message")!.props.onClick(); });
     await flush();
     assert.equal(toastCalls.filter((toast) => toast.title === "Reaction to your message" && toast.body === "🌱").length, 1,
@@ -572,26 +727,191 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
 
     await act(async () => { findButton(renderer!, "Did you see the mock album?")!.props.onClick(); });
     assert.ok(findButton(renderer!, "Reply to selected message"), "fixture selection should remain active while testing image Y");
+    await act(async () => { findButton(renderer!, "Reply to selected message")!.props.onClick(); });
+    const viewerReplyDraft = renderer!.root.findAllByType("input").find((input) => input.props["aria-label"] === "Reply");
+    assert.ok(viewerReplyDraft, "the selected fixture message should expose a reply draft before image Y");
+    await act(async () => { viewerReplyDraft!.props.onChange({ target: { value: "Draft survives image viewer" } }); });
 
-    const imageRow = renderer!.root.findAll((node) => node.props["data-decky-message-id"] === "mock-ava-2")
+    const ordinaryMessageRow = renderer!.root.findAll((node) => node.props["data-decky-message-id"] === "mock-ava-1")
       .find((node) => typeof node.props.onKeyDown === "function");
-    assert.ok(imageRow, "the fabricated image row should expose the keyboard no-op guard");
-    await act(async () => { imageRow!.props.onFocusCapture(); });
-    let yPrevented = false;
-    let yStopped = false;
-    await act(async () => { imageRow!.props.onKeyDown({ key: "y", preventDefault() { yPrevented = true; }, stopPropagation() { yStopped = true; } }); });
-    assert.equal(yPrevented, true, "keyboard Y on an image should be consumed as a no-op");
-    assert.equal(yStopped, true, "image Y should not bubble into Quick Access navigation");
-    assert.ok(findButton(renderer!, "Mounted-panel mock send"), "image Y should leave the conversation mounted");
-    assert.ok(findButton(renderer!, "Reply to selected message"), "image Y should preserve the existing reply selection");
-    assert.ok(findButton(renderer!, "Back to contacts"), "image Y should not navigate back to contacts");
+    assert.ok(ordinaryMessageRow, "ordinary messages should keep the prior div row wrapper");
+    assert.equal(ordinaryMessageRow.props.onOptionsButton, undefined, "message rows must not bind image actions to the Decky options button");
+
+    let imageRow = renderer!.root.findAll((node) => node.props["data-decky-message-id"] === "mock-ava-2")
+      .find((node) => typeof node.props.onOptionsButton === "function");
+    assert.ok(imageRow, "the fabricated image row should expose its Decky gamepad action");
+    assert.equal(typeof imageRow.props.onGamepadFocus, "function", "Decky gamepad focus should track the image row for controller Y");
+    await act(async () => { imageRow!.props.onGamepadFocus(); });
+
+    const focusedImageReactionText = () => {
+      const row = renderer!.root.findAll((node) => node.props["data-decky-message-id"] === "mock-ava-2")
+        .find((node) => typeof node.props.onOptionsButton === "function");
+      assert.ok(row, "the focused image row remains mounted");
+      return textOf(row as unknown as { children: unknown[] });
+    };
+    const imageReactionBeforeX = focusedImageReactionText();
+    await act(async () => { controllerListener?.(0, 2, true); });
+    await flush();
+    const imageReactionAfterX = focusedImageReactionText();
+    assert.notEqual(imageReactionAfterX, imageReactionBeforeX, "controller X still mutates the focused MOCK conversation when the viewer is closed");
+    assert.match(imageReactionAfterX, /❤️/, "normal controller X adds its configured reaction to the focused MOCK message");
 
     await act(async () => { controllerListener?.(0, 3, true); });
+    assert.equal(modalCalls.length, 0, "the global controller listener must not open an image before Decky's cancellable row action");
+    let optionsPrevented = false;
+    let optionsStopped = false;
+    await act(async () => { imageRow!.props.onOptionsButton({ preventDefault() { optionsPrevented = true; imageYOrder.push("prevent"); }, stopPropagation() { optionsStopped = true; imageYOrder.push("stop"); } }); });
+    assert.equal(optionsPrevented, true, "the Decky image action should suppress default controller navigation");
+    assert.equal(optionsStopped, true, "the Decky image action should not bubble into Quick Access navigation");
+    assert.deepEqual(imageYOrder, ["prevent", "stop", "open"], "raw Y is ignored and Decky's cancellable action is contained before opening");
+    assert.equal(modalCalls.length, 1, "the focused row's Decky action opens one SteamUI modal for the MOCK image");
+    const reactionTextBeforeViewerX = focusedImageReactionText();
+    await act(async () => { controllerListener?.(0, 2, true); });
+    await flush();
+    assert.equal(focusedImageReactionText(), reactionTextBeforeViewerX, "controller X is ignored while the image viewer is active and cannot mutate the underlying conversation");
+    assert.equal(modalCalls[0].options?.strTitle, "Image viewer");
+    const imageViewer = modalCalls[0].modal as React.ReactElement<{ imageDataUrl: string }>;
+    assert.equal(imageViewer.props.imageDataUrl, "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="160" height="100"><rect width="160" height="100" fill="#276b91"/><text x="12" y="55" fill="white" font-size="16">MOCK IMAGE</text></svg>'),
+      "the modal should receive the locally fabricated image at its original data URL");
+    assert.ok(findButton(renderer!, "Mounted-panel mock send"), "image Y should leave the conversation mounted until Steam closes Quick Access");
+    assert.ok(findButton(renderer!, "Reply to selected message"), "image Y should preserve the selected message before the modal handoff");
+
+    await act(async () => { controllerListener?.(0, 3, true); });
+    assert.equal(modalCalls.length, 1, "controller Y while the viewer is open must not create another modal");
+
+    await act(async () => { renderer!.unmount(); });
+    renderer = undefined;
+    assert.equal(modalCloseCalls, 0, "the Steam-triggered panel unmount must leave the independently owned image modal open");
+    const closeFirstImageViewer = (imageViewer.props as { onCancel: () => void }).onCancel;
+    await act(async () => { closeFirstImageViewer(); });
+    assert.equal(modalCloseCalls, 1, "B closes the viewer without discarding its conversation handoff");
+
+    activeMockElement = { matches: (selector) => selector === "input, textarea, select" };
+    mockScrollViewport.scrollTop = 0;
+    conversationMessageQueries = 0;
+    imageBoundsCalls = 0;
+    await act(async () => { renderer = mountPanel(descriptor!.content); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 220)); });
+    await flush();
+    await flush();
+    assert.ok(messageDomElements.has("mock-ava-2"), "the returned image has a synthetic DOM target for focus/scroll restoration");
+    assert.ok(conversationMessageQueries > 0 && imageBoundsCalls > 0, "the returned image row participates in DOM scroll restoration");
+    assert.ok(findButton(renderer!, "Did you see the mock album?"), "closing the viewer and remounting the panel restores the same MOCK conversation");
+    assert.ok(findButton(renderer!, "Reply to selected message"), "the selected message is restored after the modal handoff");
+    assert.ok(renderer!.root.findAllByType("input").some((input) => input.props["aria-label"] === "Reply" && input.props.value === "Draft survives image viewer"),
+      "the in-memory reply draft survives the modal-triggered panel unmount");
+    imageRow = renderer!.root.findAll((node) => node.props["data-decky-message-id"] === "mock-ava-2")
+      .find((node) => typeof node.props.onOptionsButton === "function")!;
+    assert.ok(imageRow, "the focused image selection is restored after the panel remount");
+    assert.equal(imageRow.props.preferredFocus, true, "Steam navigation marks the restored image as its preferred child");
+    const restoredConversationFocusable = renderer!.root.findAll((node) => typeof node.props.onCancel === "function" && typeof node.props.onFocusCapture === "function")[0];
+    assert.equal(restoredConversationFocusable.props.navEntryPreferPosition, 4, "the remounted conversation enters on its preferred image row instead of Load more messages");
+    assert.equal(mockScrollViewport.scrollTop, 650, "the image scroll anchor is reapplied after a session change clears the history expansion anchor");
+    assert.equal(imageDomFocusCalls, 0, "restoring the image scroll does not steal DOM focus from the reply input");
+    assert.ok(findButton(renderer!, "Back to contacts"), "restoration returns to the conversation rather than the contacts page");
+    activeMockElement = null;
+    await act(async () => { controllerListener?.(0, 2, true); });
+    await flush();
+    assert.notEqual(focusedImageReactionText(), reactionTextBeforeViewerX, "controller X works again after the image viewer closes");
+
+    let keyboardYPrevented = false;
+    const keyboardOrderStart = imageYOrder.length;
+    await act(async () => { imageRow!.props.onKeyDown({ key: "y", preventDefault() { keyboardYPrevented = true; imageYOrder.push("prevent"); }, stopPropagation() { imageYOrder.push("stop"); } }); });
+    assert.equal(keyboardYPrevented, true, "keyboard Y on an image should be consumed");
+    assert.deepEqual(imageYOrder.slice(keyboardOrderStart), ["prevent", "stop"], "keyboard Y is consumed without bypassing Decky's cancellable image action");
+    assert.equal(modalCalls.length, 1, "keyboard Y must not open an image viewer outside Decky's row action");
+
+    let secondOptionsPrevented = false;
+    let secondOptionsStopped = false;
+    const secondOptionsOrderStart = imageYOrder.length;
+    await act(async () => { imageRow!.props.onOptionsButton({ preventDefault() { secondOptionsPrevented = true; imageYOrder.push("prevent"); }, stopPropagation() { secondOptionsStopped = true; imageYOrder.push("stop"); } }); });
+    assert.equal(secondOptionsPrevented, true);
+    assert.equal(secondOptionsStopped, true);
+    assert.deepEqual(imageYOrder.slice(secondOptionsOrderStart), ["prevent", "stop", "open"], "the Decky action cancels navigation before the next modal opens");
+    assert.equal(modalCalls.length, 2, "the Decky row action reopens the viewer after explicit dismissal");
+    await act(async () => { closeFirstImageViewer(); });
+    assert.equal(modalCloseCalls, 1, "a stale close callback cannot close or release a newer viewer");
+    await act(async () => { imageRow!.props.onOptionsButton({ preventDefault() {}, stopPropagation() {} }); });
+    assert.equal(modalCalls.length, 2, "a stale close callback cannot clear the active viewer guard");
+
+    await act(async () => { controllerListener?.(0, 3, true); });
+    assert.equal(modalCalls.length, 2, "controller Y while the viewer is open must not create another image modal");
     assert.ok(findButton(renderer!, "Mounted-panel mock send"), "controller Y on an image should leave the conversation mounted");
     assert.ok(findButton(renderer!, "Reply to selected message"), "controller Y on an image should preserve reply selection");
     assert.ok(findButton(renderer!, "Back to contacts"), "controller Y on an image should not navigate back to contacts");
 
-    await act(async () => { findButton(renderer!, "Back to contacts")!.props.onClick(); });
+    const conversationFocusable = renderer!.root.findAll((node) => typeof node.props.onCancel === "function" && typeof node.props.onFocusCapture === "function")[0];
+    assert.ok(conversationFocusable, "the active conversation should handle its own B/cancel navigation");
+    const secondImageViewer = modalCalls[1].modal as React.ReactElement<{ onClose?: () => void; onCancel?: () => void }>;
+    assert.equal(typeof secondImageViewer.props.onCancel, "function", "the mounted SteamUI modal provides its cancel callback to the viewer target");
+    let viewerFocusRefCalls = 0;
+    let viewerElementFocusCalls = 0;
+    const viewerFocusRenderer = create(React.createElement(ImageViewerFocusTarget, {
+      FocusableComponent: React.forwardRef<HTMLDivElement, { children?: React.ReactNode; [key: string]: unknown }>((props, ref) => React.createElement("div", { ...props, ref }, props.children)),
+      navEntryPreferPosition: 0,
+      onCancel: secondImageViewer.props.onCancel || (() => secondImageViewer.props.onClose?.()),
+      focusTargetRef: (element) => {
+        if (!element) return;
+        viewerFocusRefCalls += 1;
+        element.focus({ preventScroll: true });
+      }
+    }, React.createElement("img", { src: "data:image/png;base64,AA==" })), {
+      createNodeMock(element) {
+        if (element.type !== "div") return null;
+        return { focus() { viewerElementFocusCalls += 1; } };
+      }
+    });
+    const viewerFocusable = viewerFocusRenderer.root.findByType("div");
+    assert.equal(viewerFocusable.props.tabIndex, 0, "the viewer's Decky Focusable target is explicitly programmatically focusable");
+    assert.equal(viewerFocusRefCalls, 1, "the viewer target ref receives its mounted element");
+    assert.equal(viewerElementFocusCalls, 1, "the viewer target's mounted element is programmatically focused through that ref");
+    let cancelPrevented = false;
+    let cancelStopped = false;
+    const viewerCancelEvent = {
+      preventDefault() { cancelPrevented = true; },
+      stopPropagation() { cancelStopped = true; }
+    };
+    await act(async () => {
+      viewerFocusable.props.onCancel(viewerCancelEvent);
+      if (!cancelStopped) conversationFocusable!.props.onCancel(viewerCancelEvent);
+    });
+    assert.equal(cancelPrevented, true, "the viewer's own Focusable target prevents Decky navigation");
+    assert.equal(cancelStopped, true, "the viewer's own Focusable target stops B from reaching conversation navigation");
+    assert.equal(modalCloseCalls, 2, "the same B/cancel should close the active image viewer exactly once");
+    assert.ok(findButton(renderer!, "Mounted-panel mock send"), "B/cancel closing the image viewer should preserve the conversation");
+    assert.ok(findButton(renderer!, "Back to contacts"), "B/cancel on the image viewer must not navigate back to contacts");
+    viewerFocusRenderer.unmount();
+
+    await flush();
+    let optionsPressPrevented = false;
+    let optionsPressStopped = false;
+    await act(async () => { imageRow!.props.onOptionsButton({ preventDefault() { optionsPressPrevented = true; }, stopPropagation() { optionsPressStopped = true; } }); });
+    assert.equal(optionsPressPrevented, true, "Decky's focused Y action should suppress default navigation");
+    assert.equal(optionsPressStopped, true, "Decky's focused Y action should stay inside the MOCK image row");
+    assert.equal(modalCalls.length, 3, "the image viewer should reopen after B/cancel closes it");
+    const thirdImageViewer = modalCalls[2].modal as React.ReactElement<{ onClose?: () => void; onCancel?: () => void }>;
+    await act(async () => { controllerListener?.(0, 3, true); });
+    assert.equal(modalCalls.length, 3, "the shared controller Y listener must not duplicate an active viewer");
+    // B was released before this delayed ModalRoot callback. No raw B listener
+    // or time-based latch is needed because the modal Focusable consumed B.
+    await act(async () => { controllerListener?.(0, 1, false); });
+    await act(async () => { thirdImageViewer.props.onCancel?.(); });
+    assert.ok(findButton(renderer!, "Mounted-panel mock send"), "a delayed ModalRoot cancel after B release preserves the conversation");
+    assert.ok(findButton(renderer!, "Back to contacts"), "the delayed modal callback does not navigate to contacts");
+    cancelPrevented = false;
+    cancelStopped = false;
+    await act(async () => { conversationFocusable!.props.onCancel({ preventDefault() { cancelPrevented = true; }, stopPropagation() { cancelStopped = true; } }); });
+    assert.equal(cancelPrevented, true, "a later B is handled by the conversation after modal dismissal");
+    assert.equal(cancelStopped, true, "the later conversation B is contained within its Focusable");
+    assert.ok(findButton(renderer!, "Second Session — Nia"), "the later B returns to contacts normally");
+
+    await act(async () => { renderer!.unmount(); });
+    renderer = undefined;
+    await act(async () => { renderer = mountPanel(descriptor!.content); });
+    await flush();
+    assert.ok(findButton(renderer!, "Ava Example"), "an ordinary later panel reopen starts at contacts");
+    assert.equal(findButton(renderer!, "Did you see the mock album?"), undefined, "a consumed viewer handoff cannot restore stale conversation navigation");
+
     const secondarySession = findButton(renderer!, "Second Session — Nia");
     assert.ok(secondarySession, "the secondary-session fixture conversation should be listed");
     await act(async () => { secondarySession!.props.onClick(); });
@@ -618,8 +938,20 @@ test("mounted mock panel runs effects and handlers offline and cleans up across 
     }
     assert.deepEqual(networkUrls, [], "view-once Y presses must not request media over fetch or WebSocket");
 
+    await act(async () => { findButton(renderer!, "Back to contacts")!.props.onClick(); });
+    await act(async () => { findButton(renderer!, "Ava Example")!.props.onClick(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 180)); });
+    await flush();
+    const activeImageRow = renderer!.root.findAll((node) => node.props["data-decky-message-id"] === "mock-ava-2")
+      .find((node) => typeof node.props.onOptionsButton === "function");
+    assert.ok(activeImageRow, "Ava's fabricated image should be available to open before unmount");
+    await act(async () => { activeImageRow!.props.onOptionsButton({ preventDefault() {}, stopPropagation() {} }); });
+    assert.equal(modalCalls.length, 4, "the panel has an active image modal at unmount");
+
     await act(async () => { renderer!.unmount(); });
+    assert.equal(modalCloseCalls, 3, "an ordinary panel unmount leaves the independently owned image modal open");
     descriptor.onDismount?.();
+    assert.equal(modalCloseCalls, 4, "full plugin dismount closes the active image modal exactly once");
     renderer = undefined;
     assert.equal(intervals.size, 0, "unmount should clear the health polling interval");
     assert.ok(controllerUnregistered >= 1, "unmount should unregister controller handlers");

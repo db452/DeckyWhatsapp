@@ -1,6 +1,6 @@
 import type { IncomingMessage } from "../types/message";
 
-export type MessageYAction = "toggle-audio" | "toggle-video";
+export type MessageYAction = "toggle-audio" | "toggle-video" | "open-image";
 
 export interface MessageYPressOptions {
   isTextEntryFocused: () => boolean;
@@ -16,10 +16,12 @@ export function createMessageYPressHandler(options: MessageYPressOptions) {
   };
 }
 
-/** Images remain inline; Y toggles playback only for supported audio and ordinary video. */
-export function getMessageYAction(message?: IncomingMessage): MessageYAction | undefined {
-  const media = message?.media;
-  if (!media?.dataUrl || message?.viewOnce) return undefined;
+/** Y opens loaded images and otherwise toggles supported audio or ordinary video playback. */
+export function getMessageYAction(message?: IncomingMessage, providerVariant: "production" | "mock" = "production"): MessageYAction | undefined {
+  if (!message || message.viewOnce || message.mediaLoadState) return undefined;
+  const media = message.media || (message.image ? { ...message.image, kind: "image" as const, mimetype: "image/jpeg" } : undefined);
+  if (!media?.dataUrl) return undefined;
+  if (media.kind === "image") return "open-image";
   if (media.kind === "audio") return "toggle-audio";
   if (media.kind === "video") return "toggle-video";
   return undefined;

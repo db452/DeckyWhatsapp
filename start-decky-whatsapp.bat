@@ -42,6 +42,12 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+echo.
+echo   .--------------------------------.
+echo   ^|  o  +--------------------+  o  ^|
+echo   ^|     ^|   DECKY WHATSAPP   ^|     ^|
+echo   '-----+--------------------+-----'
+echo.
 echo Using loopback bridge port %BRIDGE_PORT% and Steam Deck %DECK_USER%@%DECK_HOST%.
 
 echo Checking the local bridge port...
@@ -109,9 +115,8 @@ pushd "%PROJECT_DIR%" || goto :project_dir_error
 for /f "delims=" %%H in ('node.exe scripts\suggest-deck-host.mjs 2^>nul') do if not defined DECK_SUGGESTION set "DECK_SUGGESTION=%%H"
 popd
 if defined DECK_SUGGESTION (
-    echo Suggested hostname %DECK_SUGGESTION% resolved. You can replace it with another hostname or IP.
-    set /p "DECK_HOST=Steam Deck hostname or IPv4 address [%DECK_SUGGESTION%]: "
-    if not defined DECK_HOST call set "DECK_HOST=%%DECK_SUGGESTION%%"
+    set "DECK_HOST=%DECK_SUGGESTION%"
+    echo Automatically selected Steam Deck hostname %DECK_SUGGESTION%.
 ) else (
     echo No known Steam Deck hostname resolved.
     set /p "DECK_HOST=Enter the Steam Deck IPv4 address or DNS hostname manually: "

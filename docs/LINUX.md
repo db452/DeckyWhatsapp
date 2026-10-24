@@ -33,7 +33,9 @@ archive.
 3. The installer checks the Steam Deck SSH connection and may offer optional
    SSH-key setup. Existing key files are not overwritten. Review each prompt;
    declining package or key setup leaves those steps for you to complete
-   manually.
+   manually. It also adds a matching launcher to the companion folder and
+   applications menu, plus the Desktop when that folder exists. GNOME may ask
+   you to right-click a launcher and choose **Allow Launching**.
 4. Start the bridge only when you want to use it:
 
    ```sh

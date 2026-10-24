@@ -22,7 +22,10 @@ powershell -ExecutionPolicy Bypass -File .\install-decky-whatsapp-windows.ps1
 
 The installer checks Node.js, Git, and OpenSSH, installs the bridge's locked
 dependencies, creates the dedicated SSH key if it does not already exist, and
-creates Desktop and Start Menu shortcuts. It does not replace an existing key.
+creates an icon-bearing shortcut in the companion folder, on the Desktop, and
+in the Start Menu.
+It does not replace an existing key. Run the installer again to refresh those
+shortcuts after moving the extracted companion folder.
 If PowerShell blocks `npm.ps1`, the installer invokes `npm.cmd` directly.
 
 To install the public key on the Deck for passwordless SSH startup, run:
@@ -41,13 +44,14 @@ Start from the **Decky WhatsApp** shortcut or run:
 .\start-decky-whatsapp.bat
 ```
 
-The launcher suggests a resolvable conventional Deck hostname, then asks you to
-confirm or replace it. This lookup checks only a short list of names through
-Windows name resolution; it is not a LAN scan and does not authenticate. If no
-name resolves, enter a hostname or IPv4 address. The launcher starts separate
-bridge and SSH tunnel windows. Keep both open while using the plugin. The first
-bridge start may display a WhatsApp QR code; scan it with the phone if
-requested. Authentication data remains locally in `.wwebjs_auth/`.
+The launcher checks a short list of conventional Deck hostnames concurrently
+through Windows name resolution, with a 20-second overall deadline, and
+automatically selects the first resolvable name in preference order. This is
+not a LAN scan and does not authenticate. If no name resolves, enter a
+hostname or IPv4 address manually. The launcher starts separate bridge and SSH
+tunnel windows. Keep both open while using the plugin. The first bridge start
+may display a WhatsApp QR code; scan it with the phone if requested.
+Authentication data remains locally in `.wwebjs_auth/`.
 
 The foreground launcher checks that the local bridge port is free before it
 starts, and leaves an existing listener running. The bridge binds to

@@ -11,6 +11,7 @@ $installerDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $adjacentLauncher = Join-Path $installerDirectory "start-decky-whatsapp.bat"
 $projectRoot = if (Test-Path -LiteralPath $adjacentLauncher -PathType Leaf) { $installerDirectory } else { Split-Path -Parent $installerDirectory }
 $launcher = Join-Path $projectRoot "start-decky-whatsapp.bat"
+$launcherIcon = Join-Path $projectRoot "assets\decky-whatsapp.ico"
 $sshDirectory = Join-Path $env:USERPROFILE ".ssh"
 $sshKey = Join-Path $sshDirectory "decky_whatsapp_ed25519"
 $sshPublicKey = "$sshKey.pub"
@@ -40,6 +41,9 @@ function Add-GitToCurrentPath {
 
 if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
     throw "Could not find start-decky-whatsapp.bat at $launcher"
+}
+if (-not $SkipShortcuts -and -not (Test-Path -LiteralPath $launcherIcon -PathType Leaf)) {
+    throw "Could not find the Decky WhatsApp launcher icon at $launcherIcon"
 }
 
 Write-Host "Checking Windows prerequisites..."
@@ -156,6 +160,18 @@ if (-not $SkipShortcuts) {
         $shortcut.Arguments = "/c `"$launcher`""
         $shortcut.WorkingDirectory = $projectRoot
         $shortcut.Description = "Start the Decky WhatsApp bridge and SSH tunnel"
+        $shortcut.IconLocation = "$launcherIcon,0"
+        $shortcut.Save()
+    }
+
+    $projectFolderShortcut = Join-Path $projectRoot "Decky WhatsApp.lnk"
+    if (-not (Test-Path -LiteralPath $projectFolderShortcut)) {
+        $shortcut = $shell.CreateShortcut($projectFolderShortcut)
+        $shortcut.TargetPath = Join-Path $env:WINDIR "System32\cmd.exe"
+        $shortcut.Arguments = "/c `"$launcher`""
+        $shortcut.WorkingDirectory = $projectRoot
+        $shortcut.Description = "Start the Decky WhatsApp bridge and SSH tunnel"
+        $shortcut.IconLocation = "$launcherIcon,0"
         $shortcut.Save()
     }
 }

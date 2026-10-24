@@ -13,29 +13,35 @@ export const DECK_HOST_CANDIDATES = Object.freeze([
   "steamdeck",
 ]);
 
-export const DECK_HOST_LOOKUP_TIMEOUT_MS = 1500;
+export const DECK_HOST_LOOKUP_TIMEOUT_MS = 20_000;
 
 export async function suggestDeckHost(
   resolve = lookup,
   timeoutMs = DECK_HOST_LOOKUP_TIMEOUT_MS,
 ) {
-  for (const candidate of DECK_HOST_CANDIDATES) {
-    let timeout;
+  const resultsByCandidate = Array(DECK_HOST_CANDIDATES.length);
+  const lookups = DECK_HOST_CANDIDATES.map(async (candidate, index) => {
     try {
-      const results = await Promise.race([
-        resolve(candidate, { all: true }),
-        new Promise((_, reject) => {
-          timeout = setTimeout(() => reject(new Error("DNS lookup timed out")), timeoutMs);
-        }),
-      ]);
-      if (Array.isArray(results) && results.length > 0) return candidate;
+      const results = await resolve(candidate, { all: true });
+      resultsByCandidate[index] = Array.isArray(results) && results.length > 0;
     } catch {
-      // A missing candidate is expected; try the next bounded name.
-    } finally {
-      clearTimeout(timeout);
+      // A missing candidate is expected; check the remaining names too.
+      resultsByCandidate[index] = false;
     }
-  }
-  return null;
+  });
+
+  let timeout;
+  await Promise.race([
+    Promise.all(lookups),
+    new Promise((resolveDeadline) => {
+      timeout = setTimeout(resolveDeadline, timeoutMs);
+    }),
+  ]);
+  clearTimeout(timeout);
+
+  // Evaluate in preference order even though every lookup ran concurrently.
+  const resolvedIndex = resultsByCandidate.findIndex((resolved) => resolved === true);
+  return resolvedIndex === -1 ? null : DECK_HOST_CANDIDATES[resolvedIndex];
 }
 
 export async function runSuggestionCli({

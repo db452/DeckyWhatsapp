@@ -122,6 +122,12 @@ if [[ -z "${deck_host}" ]]; then
 fi
 valid_deck_host "${deck_host}" || fail "Invalid Steam Deck hostname/address. Use a hostname or IP without spaces or SSH options."
 
+printf '\n'
+printf '  .--------------------------------.\n'
+printf '  |  o  +--------------------+  o  |\n'
+printf '  |     |   DECKY WHATSAPP   |     |\n'
+printf "  '-----+--------------------+-----\n"
+printf '\n'
 printf 'Using loopback bridge port %s and Steam Deck %s@%s.\n' "${bridge_port}" "deck" "${deck_host}"
 printf 'The bridge will run from the project directory so .env and WhatsApp session/cache locations stay stable.\n'
 printf 'Foreground mode: the WhatsApp bridge and SSH tunnel use this same terminal; no second window is opened.\n'

@@ -16,12 +16,22 @@ function makeMessage(media?: IncomingMessage["media"]): IncomingMessage {
   };
 }
 
-test("Y has no action for images or unsupported media", () => {
-  assert.equal(getMessageYAction(makeMessage({ dataUrl: "data:image/jpeg;base64,AA==", kind: "image", mimetype: "image/jpeg" })), undefined);
+test("Y opens a loaded image in production and offline MOCK providers", () => {
+  const image = makeMessage({ dataUrl: "data:image/jpeg;base64,AA==", kind: "image", mimetype: "image/jpeg" });
+  assert.equal(getMessageYAction(image), "open-image");
+  assert.equal(getMessageYAction(image, "mock"), "open-image");
+  assert.equal(getMessageYAction({ ...image, mediaLoadState: "unavailable" }, "mock"), undefined,
+    "a failed image load must not reopen the viewer even if media data is retained");
+  assert.equal(getMessageYAction({ ...image, mediaLoadState: "loading" }, "mock"), undefined,
+    "an image still loading must not open the viewer");
+  assert.equal(getMessageYAction({ ...image, viewOnce: true }, "mock"), undefined);
+  assert.equal(getMessageYAction(makeMessage({ dataUrl: "", kind: "image", mimetype: "image/jpeg" }), "mock"), undefined);
+  assert.equal(getMessageYAction({ ...image, media: undefined, image: { dataUrl: image.media!.dataUrl, filename: "fixture.jpg" } }, "mock"), "open-image");
+});
+
+test("Y has no action for unsupported media", () => {
   assert.equal(getMessageYAction(makeMessage()), undefined);
   assert.equal(getMessageYAction(makeMessage({ dataUrl: "data:video/mp4;base64,AA==", kind: "gif", mimetype: "video/mp4" })), undefined);
-  assert.equal(getMessageYAction(makeMessage({ dataUrl: "data:image/gif;base64,AA==", kind: "image", mimetype: "image/gif" })), undefined);
-  assert.equal(getMessageYAction(makeMessage({ dataUrl: "", kind: "image", mimetype: "image/jpeg" })), undefined);
 });
 
 test("Y keeps audio on the existing play/pause action", () => {

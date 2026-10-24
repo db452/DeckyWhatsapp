@@ -93,7 +93,7 @@ if [[ "$needs_toolchain" == "1" ]]; then
 
   echo "Preparing the Pacman keyring..."
   sudo pacman-key --init
-  sudo pacman-key --populate archlinux
+  sudo pacman-key --populate
 
   # Pacman's --needed can skip a package whose database version is current
   # even when one of its installed headers is missing. Reinstall only owners

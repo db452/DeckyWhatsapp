@@ -1,6 +1,6 @@
 // Decky panel for WhatsApp conversations, notifications, preferences, and local voice typing.
 import { definePlugin, toaster } from "@decky/api";
-import { ButtonItem, Focusable, NavEntryPositionPreferences, PanelSection, PanelSectionRow, Router } from "@decky/ui";
+import { ButtonItem, Focusable, ModalRoot, NavEntryPositionPreferences, PanelSection, PanelSectionRow, Router, showModal } from "@decky/ui";
 import { FaWhatsapp } from "react-icons/fa";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { provider } from "./providers/provider-selected";
@@ -11,6 +11,7 @@ import { createNotificationIdCache } from "./notifications/notification-id-cache
 import { createNotificationSession } from "./notifications/notification-session";
 import { getReactionNotification } from "./notifications/reaction-notification";
 import { prepareSteamListenerNamespace, registerControllerInputMessages } from "./platform/steam-compat";
+import { handleConversationCancel } from "./platform/image-viewer-cancel";
 import { attachResumeRegistration } from "./plugin-lifecycle";
 import { ConversationMessages } from "./components/ConversationMessages";
 import { ContactBrowser } from "./components/ContactBrowser";
@@ -18,6 +19,7 @@ import type { ContactsState } from "./components/ContactBrowser";
 import { DiagnosticsPanel } from "./components/DiagnosticsPanel";
 import { SelectedMessageActions } from "./components/SelectedMessageActions";
 import { ReplyComposer } from "./components/ReplyComposer";
+import { ImageViewerModal } from "./components/ImageViewerModal";
 import type { ReplyTarget } from "./types/conversation";
 import { MessageMedia } from "./components/MessageMedia";
 import { reactionChoices, SettingsPanel } from "./components/SettingsPanel";
@@ -26,11 +28,20 @@ import { useVoiceTyping } from "./hooks/useVoiceTyping";
 import { useConversationHistory } from "./hooks/useConversationHistory";
 import { useBridgeConnection } from "./hooks/useBridgeConnection";
 import { useConversationActions } from "./hooks/useConversationActions";
+import type { ConversationRestoreSnapshot } from "./hooks/useConversationHistory";
 import { createMessageYPressHandler, getMessageYAction } from "./messages/message-actions";
 import type { ChatSummary } from "./types/chat";
 import type { IncomingMessage } from "./types/message";
 
 let reconnectMountedPanel: (() => void) | undefined;
+let dismissImageViewer: (() => void) | undefined;
+let activeImageViewerToken: object | undefined;
+let imageViewerHandoff: (ConversationRestoreSnapshot & {
+  selectedMessageId: string;
+  replyTarget?: ReplyTarget;
+  reply: string;
+}) | undefined;
+let imageViewerPanelUnmounted = false;
 const pluginConnectionSession = createPluginConnectionSession();
 // ControllerInputGamepadButton.GAMEPAD_BUTTON_Y in the installed @decky/ui declaration.
 const steamControllerYButton = 3;
@@ -130,8 +141,8 @@ function WhatsAppPanel() {
   const [uncertainDeliveryIds, setUncertainDeliveryIds] = useState<Set<string>>(() => new Set());
   const uncertainDeliveryIdsRef = useRef(uncertainDeliveryIds);
   const [ownReactions, setOwnReactions] = useState<Record<string, string | null>>({});
-  const [selectedMessageId, setSelectedMessageId] = useState("");
-  const [focusedMessageId, setFocusedMessageId] = useState("");
+  const [selectedMessageId, setSelectedMessageId] = useState(() => imageViewerHandoff?.selectedMessageId || "");
+  const [focusedMessageId, setFocusedMessageId] = useState(() => imageViewerHandoff?.focusedMessageId || "");
   const focusedMessageIdRef = useRef("");
   const messageYAction = useRef<(messageId: string) => boolean>(() => false);
   const messageYPress = useRef<(messageId: string) => boolean>(() => false);
@@ -159,6 +170,8 @@ function WhatsAppPanel() {
   });
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
+  const historyRef = useRef<IncomingMessage[]>([]);
+  const imageViewerRef = useRef<ReturnType<typeof showModal> | undefined>(undefined);
   const conversationFocusRef = useRef<HTMLDivElement | null>(null);
   const replyFieldContainerRef = useRef<HTMLDivElement | null>(null);
   const panelMounted = useRef(true);
@@ -189,8 +202,15 @@ function WhatsAppPanel() {
     historyAppliedConversationRun, recentLiveMessages, conversationRun, historyRevision,
     bridgeSessionEstablished, invalidateSession, invalidateHistory,
     abortHistory, loadHistory, selectChat, loadMoreHistory, retryMediaLoad, markMediaUnavailable,
-    closeConversation: closeHistoryConversation, clearForDisconnect
+    closeConversation: closeHistoryConversation, clearForDisconnect, restoreConversation
   } = conversation;
+  historyRef.current = history;
+  const imageViewerReturnFocus = useRef<{
+    chatId: string;
+    conversationRun: number;
+    messageId: string;
+    historyVersionAtRestore: number;
+  } | undefined>(undefined);
   const actions = useConversationActions({
     selectedChatId,
     selectedChat,
@@ -221,10 +241,29 @@ function WhatsAppPanel() {
     panelMounted.current = true;
     return () => {
       panelMounted.current = false;
+      if (activeImageViewerToken) imageViewerPanelUnmounted = true;
       conversationRun.current += 1;
       abortHistory();
     };
   }, []);
+
+  useEffect(() => {
+    const handoff = imageViewerHandoff;
+    if (!enabled || !handoff) return;
+    imageViewerHandoff = undefined;
+    imageViewerPanelUnmounted = false;
+    restoreConversation(handoff);
+    imageViewerReturnFocus.current = {
+      chatId: handoff.chat.chatId,
+      conversationRun: conversationRun.current,
+      messageId: handoff.focusedMessageId,
+      historyVersionAtRestore: historyAppliedVersion + 1
+    };
+    setSelectedMessageId(handoff.selectedMessageId);
+    setReplyTarget(handoff.replyTarget);
+    setReply(handoff.reply);
+    setFocusedMessageId(handoff.focusedMessageId);
+  }, [enabled]);
 
   useEffect(() => {
     if (!replyTarget) return;
@@ -435,23 +474,37 @@ function WhatsAppPanel() {
 
   useEffect(() => {
     // Restore position only after expanded history applies; discarded requests leave the anchor pending.
-    const pendingFocus = historyExpansionFocus.current;
+    const pendingImageFocus = imageViewerReturnFocus.current;
+    if (pendingImageFocus && (selectedChatIdRef.current !== pendingImageFocus.chatId
+      || conversationRun.current !== pendingImageFocus.conversationRun)) {
+      imageViewerReturnFocus.current = undefined;
+    }
+    const pendingFocus = imageViewerReturnFocus.current || historyExpansionFocus.current;
     if (!pendingFocus || historyLoading || historyExpansionPending.current) return;
     const frame = window.requestAnimationFrame(() => {
-      if (historyExpansionFocus.current !== pendingFocus
+      if ((historyExpansionFocus.current !== pendingFocus && imageViewerReturnFocus.current !== pendingFocus)
         || selectedChatIdRef.current !== pendingFocus.chatId
         || conversationRun.current !== pendingFocus.conversationRun) return;
       const conversation = conversationFocusRef.current;
       const messageElement = conversation && Array.from(conversation.querySelectorAll<HTMLElement>("[data-decky-message-id]"))
         .find((element) => element.dataset.deckyMessageId === pendingFocus.messageId);
-      historyExpansionFocus.current = undefined;
-      if (!messageElement || replyInputActive.current || isTextEntryFocused(messageElement.ownerDocument)) return;
-
-      const focusTarget = messageElement.querySelector<HTMLElement>('button, [role="button"], [tabindex="0"]');
-      focusTarget?.focus({ preventScroll: true });
-      setFocusedMessageId(pendingFocus.messageId);
+      if (!messageElement) {
+        if (imageViewerReturnFocus.current !== pendingFocus) historyExpansionFocus.current = undefined;
+        return;
+      }
+      const isImageReturnFocus = pendingImageFocus === pendingFocus && pendingImageFocus !== undefined;
+      const awaitingRestoredSessionHistory = isImageReturnFocus
+        && (!bridgeSessionEstablished.current || historyLoading || historyAppliedVersion <= pendingImageFocus.historyVersionAtRestore);
+      if (historyExpansionFocus.current === pendingFocus) historyExpansionFocus.current = undefined;
+      if (imageViewerReturnFocus.current === pendingFocus && !awaitingRestoredSessionHistory) imageViewerReturnFocus.current = undefined;
 
       const ownerDocument = messageElement.ownerDocument;
+      if (!replyInputActive.current && !isTextEntryFocused(ownerDocument)) {
+        const focusTarget = messageElement.querySelector<HTMLElement>('button, [role="button"], [tabindex="0"]');
+        focusTarget?.focus({ preventScroll: true });
+      }
+      setFocusedMessageId(pendingFocus.messageId);
+
       const ownerWindow = ownerDocument.defaultView;
       if (!ownerWindow) return;
       let scrollContainer = messageElement.parentElement;
@@ -472,12 +525,13 @@ function WhatsAppPanel() {
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [historyLoading, history.length, historyAppliedVersion]);
+  }, [selectedChatId, historyLoading, history.length, historyAppliedVersion]);
 
   useEffect(() => {
     // Decky's controller button values: X=2 and Y=3. Leave navigation and back
     // handling to SteamOS so the plugin does not replace system controls.
     return registerControllerInputMessages((_controllerIndex, gamepadButton, isButtonPressed) => {
+      if (dismissImageViewer) return;
       if (isTextEntryFocused() || replyInputActive.current) return;
       if (isButtonPressed && gamepadButton === 2) {
         const focusedMessage = history.find((message) => message.id === focusedMessageId) || history.find((message) => message.id === selectedMessageId);
@@ -514,6 +568,8 @@ function WhatsAppPanel() {
   };
 
   const disconnectLocally = () => {
+    imageViewerHandoff = undefined;
+    dismissImageViewer?.();
     pluginConnectionSession.setEnabled(false);
     provider.storageSet("enabled", "false");
     setEnabled(false);
@@ -525,6 +581,7 @@ function WhatsAppPanel() {
   const reconnectFromDiagnostics = requestReconnect;
 
   const closeConversation = () => {
+    imageViewerHandoff = undefined;
     replyInputActive.current = false;
     closeHistoryConversation();
     voiceTyping.resetVoice();
@@ -574,8 +631,59 @@ function WhatsAppPanel() {
   const activateMessageY = (messageId: string): boolean => {
     if (!messageId) return false;
     const message = history.find((item) => item.id === messageId);
-    const action = getMessageYAction(message);
+    const action = getMessageYAction(message, provider.variant);
     if (!message || !action) return false;
+    if (action === "open-image") {
+      const image = message.media || (message.image ? { ...message.image, kind: "image" as const, mimetype: "image/jpeg" } : undefined);
+      if (!image?.dataUrl || imageViewerRef.current || dismissImageViewer || !showModal || !ModalRoot) return false;
+      const viewerToken = {};
+      activeImageViewerToken = viewerToken;
+      imageViewerPanelUnmounted = false;
+      let modal: ReturnType<typeof showModal> | undefined;
+      const close = () => {
+        const activeModal = modal;
+        modal = undefined;
+        if (activeImageViewerToken === viewerToken) {
+          activeImageViewerToken = undefined;
+          if (activeModal && imageViewerRef.current === activeModal) imageViewerRef.current = undefined;
+          if (dismissImageViewer === dismissFromConversation) dismissImageViewer = undefined;
+          if (!imageViewerPanelUnmounted) imageViewerHandoff = undefined;
+        }
+        activeModal?.Close();
+      };
+      const dismissFromConversation = close;
+      try {
+        modal = showModal(
+          <ImageViewerModal
+            imageDataUrl={image.dataUrl}
+            imageLabel={image.filename || "Image"}
+            onClose={close}
+            onCancel={close}
+          />,
+          undefined,
+          { strTitle: "Image viewer", bHideActionIcons: true, bNeverPopOut: true }
+        );
+      } catch {
+        if (activeImageViewerToken === viewerToken) activeImageViewerToken = undefined;
+        return false;
+      }
+      imageViewerRef.current = modal;
+      dismissImageViewer = dismissFromConversation;
+      if (selectedChat) {
+        imageViewerHandoff = {
+          chat: selectedChat,
+          history: [...history],
+          historyLimit,
+          historyHasMore,
+          focusedMessageId: messageId,
+          selectedMessageId,
+          replyTarget,
+          reply
+        };
+        imageViewerPanelUnmounted = false;
+      }
+      return true;
+    }
     const player = action === "toggle-video" ? videoRefs.current[messageId] : audioRefs.current[messageId];
     if (!player) return false;
     if (player.paused) void player.play().catch(() => console.error(action === "toggle-video" ? "[decky-whatsapp] video playback failed" : "[decky-whatsapp] voice playback failed"));
@@ -595,12 +703,17 @@ function WhatsAppPanel() {
       if (button !== steamControllerYButton) return;
       if (!isButtonPressed) return;
       const messageId = getControllerFocusedMessageId();
-      if (messageId) messageYPress.current(messageId);
+      if (!messageId) return;
+      // Image opening must use the focused row's cancellable Decky action so
+      // the controller event cannot bubble into Steam's Quick Access navigation.
+      if (getMessageYAction(historyRef.current.find((message) => message.id === messageId), provider.variant) === "open-image") return;
+      messageYPress.current(messageId);
     }, provider.variant);
   }, [enabled, selectedChatId]);
 
   const displayedHistory = compactHistory ? history.slice(-historyLimit) : history;
   const nextHistoryLimit = getNextHistoryLimit(historyLimit, historyHasMore);
+  const focusedImageMessage = history.find((message) => message.id === focusedMessageId && getMessageYAction(message, provider.variant) === "open-image");
   const selectedMessage = selectedMessageId ? history.find((message) => message.id === selectedMessageId) : undefined;
 
   const connectionToggle = <ButtonItem layout="below" onClick={() => enabled ? disconnectLocally() : connectPlugin()}>{getConnectionToggleLabel(enabled)}</ButtonItem>;
@@ -678,15 +791,11 @@ function WhatsAppPanel() {
         />
       )}
       {selectedChatId && (
-        <Focusable ref={conversationFocusRef} navEntryPreferPosition={NavEntryPositionPreferences.FIRST} onFocusCapture={(event) => {
+        <Focusable ref={conversationFocusRef} navEntryPreferPosition={focusedImageMessage ? NavEntryPositionPreferences.PREFERRED_CHILD : NavEntryPositionPreferences.FIRST} onFocusCapture={(event) => {
           const target = event.target as HTMLElement;
           const messageElement = target.closest<HTMLElement>("[data-decky-message-id]");
           setFocusedMessageId(messageElement?.dataset.deckyMessageId || "");
-        }} onCancel={(event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          closeConversation();
-        }}>
+        }} onCancel={(event) => handleConversationCancel(event, Boolean(dismissImageViewer), () => dismissImageViewer?.(), closeConversation)}>
         <PanelSection title="Conversation">
           <ConversationMessages
             selectedChat={selectedChat}
@@ -698,6 +807,8 @@ function WhatsAppPanel() {
             historyHasMore={historyHasMore}
             historyLimit={historyLimit}
             displayedHistory={displayedHistory}
+            providerVariant={provider.variant}
+            focusedMessageId={focusedMessageId}
             selectedMessageId={selectedMessageId}
             onCloseConversation={closeConversation}
             onLoadMore={() => { void loadMoreHistory(); }}
@@ -763,6 +874,10 @@ export default definePlugin(() => {
     content: <WhatsAppPanel />,
     icon: <FaWhatsapp />,
     onDismount: () => {
+      dismissImageViewer?.();
+      activeImageViewerToken = undefined;
+      imageViewerHandoff = undefined;
+      imageViewerPanelUnmounted = false;
       pluginConnectionSession.setEnabled(false);
       provider.storageSet("enabled", "false");
       reconnectMountedPanel = undefined;

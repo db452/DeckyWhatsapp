@@ -2,10 +2,10 @@
 setlocal
 title Decky WhatsApp plugin deployment
 
-rem This command builds and stages both plugins, then asks before installing
-rem them and restarting Decky's plugin loader. The PowerShell helper performs
-rem the guarded deployment and requests sudo through an interactive SSH terminal.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\deploy-decky-plugins.ps1"
+rem This command builds and stages both plugins, then asks once before installing
+rem them and restarting Decky's shared plugin loader. The PowerShell helper
+rem performs the guarded deployment and requests sudo through an interactive SSH terminal.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\deploy-decky-plugins.ps1" -Variant both
 set "DEPLOY_EXIT=%ERRORLEVEL%"
 if not "%DEPLOY_EXIT%"=="0" (
     echo.
@@ -19,7 +19,7 @@ if not "%DEPLOY_EXIT%"=="0" (
     exit /b %DEPLOY_EXIT%
 )
 echo.
-echo Both Decky plugin variants were installed and plugin_loader.service is active.
+echo Both Decky plugin variants were installed and verified. The shared plugin_loader.service restarted automatically, reloading all Decky plugins.
 echo.
 pause
 exit /b 0

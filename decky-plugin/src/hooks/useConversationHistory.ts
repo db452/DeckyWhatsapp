@@ -32,6 +32,14 @@ type UseConversationHistoryOptions = {
   reportError: (message: string) => void;
 };
 
+export type ConversationRestoreSnapshot = {
+  chat: ChatSummary;
+  history: IncomingMessage[];
+  historyLimit: number;
+  historyHasMore: boolean;
+  focusedMessageId: string;
+};
+
 export function useConversationHistory({
   panelMounted,
   uncertainDeliveryIds,
@@ -293,6 +301,26 @@ export function useConversationHistory({
     setReplyTarget(undefined);
   };
 
+  const restoreConversation = (snapshot: ConversationRestoreSnapshot) => {
+    abortHistory();
+    const run = ++conversationRun.current;
+    selectedChatIdRef.current = snapshot.chat.chatId;
+    historyExpansionPending.current = false;
+    historyExpansionBoundary.current = undefined;
+    historyExpansionFocus.current = snapshot.focusedMessageId
+      ? { chatId: snapshot.chat.chatId, conversationRun: run, messageId: snapshot.focusedMessageId }
+      : undefined;
+    scrollOnOpen.current = null;
+    setSelectedChat(snapshot.chat);
+    setSelectedChatId(snapshot.chat.chatId);
+    setHistory(snapshot.history);
+    setHistoryLimit(snapshot.historyLimit);
+    setHistoryHasMore(snapshot.historyHasMore);
+    setHistoryLoading(false);
+    setHistoryAppliedVersion((current) => current + 1);
+    setOwnReactions(Object.fromEntries(snapshot.history.map((message) => [message.id, message.reaction || null])));
+  };
+
   const clearForDisconnect = () => {
     setSelectedChat(undefined);
     setSelectedChatId("");
@@ -308,6 +336,6 @@ export function useConversationHistory({
     historyExpansionPending, historyExpansionBoundary, historyExpansionFocus, scrollOnOpen, historyAppliedConversationRun,
     recentLiveMessages, conversationRun, historyRevision, bridgeSessionEstablished,
     invalidateSession, invalidateHistory, abortHistory, loadHistory, selectChat,
-    loadMoreHistory, retryMediaLoad, markMediaUnavailable, closeConversation, clearForDisconnect
+    loadMoreHistory, retryMediaLoad, markMediaUnavailable, closeConversation, clearForDisconnect, restoreConversation
   };
 }

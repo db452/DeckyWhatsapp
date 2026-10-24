@@ -16,7 +16,7 @@ test("suggests the first candidate that resolves and preserves its hostname", as
   });
 
   assert.equal(suggestion, "steamdeck.lan");
-  assert.deepEqual(calls, ["steamdeck.local", "steamdeck.lan"]);
+  assert.deepEqual(calls, DECK_HOST_CANDIDATES);
 });
 
 test("returns no suggestion when every bounded candidate fails to resolve", async () => {
@@ -41,7 +41,7 @@ test("does not accept an empty lookup result as a resolved host", async () => {
   assert.deepEqual(calls, DECK_HOST_CANDIDATES);
 });
 
-test("continues to the next candidate when a lookup never resolves", async () => {
+test("uses other candidates when one concurrent lookup never resolves", async () => {
   const calls = [];
   const suggestion = await suggestDeckHost(async (host) => {
     calls.push(host);
@@ -50,7 +50,7 @@ test("continues to the next candidate when a lookup never resolves", async () =>
   }, 5);
 
   assert.equal(suggestion, "steamdeck.lan");
-  assert.deepEqual(calls, DECK_HOST_CANDIDATES.slice(0, 2));
+  assert.deepEqual(calls, DECK_HOST_CANDIDATES);
 });
 
 test("returns no suggestion after timed-out and failed candidates", async () => {
